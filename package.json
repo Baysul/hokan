@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "ready": "vp check && vp run -r test && vp run -r build",
+    "ready": "vp check && vp run -r test && vp run -r build && cargo fmt --manifest-path apps/server/Cargo.toml --check && cargo clippy --manifest-path apps/server/Cargo.toml --all-targets -- -D warnings && cargo test --manifest-path apps/server/Cargo.toml",
     "dev": "vp run website#dev",
     "prepare": "vp config"
   },

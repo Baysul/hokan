@@ -6,9 +6,21 @@
   "scripts": {
     "dev": "vp dev",
     "build": "tsc && vp build",
-    "preview": "vp preview"
+    "preview": "vp preview",
+    "test": "vp test",
+    "test:e2e": "vp run build && playwright test -c playwright.config.ts"
+  },
+  "dependencies": {
+    "@fontsource-variable/fredoka": "catalog:",
+    "@fontsource-variable/manrope": "catalog:",
+    "@fontsource-variable/outfit": "catalog:",
+    "@hotwired/stimulus": "catalog:",
+    "@hotwired/turbo": "catalog:",
+    "@tailwindcss/vite": "catalog:",
+    "tailwindcss": "catalog:"
   },
   "devDependencies": {
+    "@playwright/test": "catalog:",
     "typescript": "^7.0.2",
     "vite": "catalog:",
     "vite-plus": "catalog:"

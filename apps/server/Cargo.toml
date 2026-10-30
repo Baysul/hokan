@@ -1,0 +1,30 @@
+[package]
+name = "hokan-server"
+version = "0.1.0"
+edition = "2024"
+
+[lints.clippy]
+pedantic = "warn"
+
+[dependencies]
+aws-sdk-s3 = { version = "1.156.0", default-features = false, features = [
+  "default-https-client",
+  "http-1x",
+  "rt-tokio",
+] }
+axum = "0.8"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = [
+  "io-util",
+  "macros",
+  "net",
+  "rt-multi-thread",
+  "sync",
+  "time",
+] }
+tower-http = { version = "0.7", features = ["fs"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }

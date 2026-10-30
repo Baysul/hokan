@@ -1,1 +1,5 @@
+set -e
+
 vp staged
+cargo fmt --manifest-path apps/server/Cargo.toml --check
+cargo clippy --manifest-path apps/server/Cargo.toml --all-targets -- -D warnings

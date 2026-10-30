@@ -6,7 +6,16 @@ packages:
 catalogMode: prefer
 
 catalog:
+  "@fontsource-variable/fredoka": ^5.3.0
+  "@fontsource-variable/manrope": ^5.3.0
+  "@fontsource-variable/outfit": ^5.3.0
+  "@hotwired/stimulus": ^3.2.2
+  "@hotwired/turbo": ^8.0.23
+  "@playwright/test": ^1.64.1
+  "@tailwindcss/vite": ^4.3.3
   "@types/node": ^24
+  lucide: ^1.63.0
+  tailwindcss: ^4.3.3
   typescript: ^7.0.2
   vite: npm:@voidzero-dev/vite-plus-core@1.4.0
   vite-plus: 1.4.0

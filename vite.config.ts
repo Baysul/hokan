@@ -2,7 +2,8 @@ import { defineConfig } from "vite-plus";
 
 export default defineConfig({
   staged: {
-    "*": "vp check --fix",
+    "*.{js,jsx,mjs,cjs,ts,tsx,mts,cts}": "vp check --fix",
+    "*.{css,html,json,jsonc,md,mdx,yaml,yml}": "vp fmt",
   },
   fmt: {},
   lint: {

@@ -1,0 +1,15 @@
+.git
+.vite-hooks
+.zed
+**/node_modules
+**/target
+**/dist
+**/dist-ssr
+**/test-results
+**/playwright-report
+**/__pycache__
+.env
+.env.*
+*.env
+*.local
+*.log
