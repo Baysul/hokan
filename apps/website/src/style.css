@@ -728,7 +728,9 @@ select:focus-visible {
   background: #081029;
   margin: 0 0 16px;
   overflow: hidden;
-  transition: border-color 0.15s;
+  transition:
+    border-color 0.15s,
+    box-shadow 0.15s;
 }
 .link-field:focus-within {
   border-color: var(--cyan);
@@ -767,6 +769,47 @@ select:focus-visible {
 }
 .status-message:empty {
   display: none;
+}
+/* Success gets the heading's gold star instead of the warning pink: it spins in and
+   throws off a few sparks. Reduced motion drops the animations, which also hides the sparks. */
+.copied-note {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--muted);
+  font-size: 14px;
+}
+.copied-note strong {
+  color: var(--text);
+}
+.copied-note:before {
+  content: "✦";
+  flex: none;
+  width: 30px;
+  color: var(--gold);
+  font-size: 26px;
+  line-height: 1;
+  text-align: center;
+  animation:
+    star-pop 0.7s var(--spring) both,
+    twinkle 2.4s ease-in-out 1s infinite;
+}
+.copied-note:after {
+  content: "";
+  position: absolute;
+  top: calc(50% - 2px);
+  left: 13px;
+  width: 4px;
+  height: 4px;
+  background: var(--gold);
+  opacity: 0;
+  pointer-events: none;
+  animation: sparks 0.7s var(--glide) both;
+}
+.result-view.is-copied .link-field {
+  border-color: var(--gold);
+  box-shadow: 3px 3px 0 var(--gold-shade);
 }
 
 @keyframes rise {
@@ -1053,6 +1096,24 @@ select:focus-visible {
   }
   to {
     left: 100%;
+  }
+}
+@keyframes sparks {
+  from {
+    opacity: 1;
+    box-shadow:
+      0 0 var(--gold),
+      0 0 var(--gold),
+      0 0 var(--gold),
+      0 0 var(--gold);
+  }
+  to {
+    opacity: 0;
+    box-shadow:
+      -18px -14px var(--gold),
+      18px -16px var(--gold),
+      -16px 15px var(--gold),
+      19px 13px var(--gold);
   }
 }
 @keyframes star-pop {

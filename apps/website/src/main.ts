@@ -302,7 +302,16 @@ class ShareController extends Controller<HTMLElement> {
   async copy() {
     try {
       await navigator.clipboard.writeText(this.linkTarget.value);
-      this.statusTarget.textContent = "Link copied. Share it with someone you trust.";
+      // Clearing first lets the star burst play again when the link is copied twice.
+      this.statusTarget.replaceChildren();
+      void this.statusTarget.offsetWidth;
+      const note = document.createElement("span");
+      note.className = "copied-note";
+      const lead = document.createElement("strong");
+      lead.textContent = "Link copied.";
+      note.append(lead, " Share it with someone you trust.");
+      this.statusTarget.append(note);
+      this.resultTarget.classList.add("is-copied");
     } catch {
       this.linkTarget.select();
       this.statusTarget.textContent = "Select and copy the link above.";
@@ -312,6 +321,7 @@ class ShareController extends Controller<HTMLElement> {
     this.remove();
     this.linkTarget.value = "";
     this.statusTarget.textContent = "";
+    this.resultTarget.classList.remove("is-copied");
     this.resultTarget.hidden = true;
     this.sendViewTarget.hidden = false;
   }
