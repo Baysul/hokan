@@ -1,4 +1,5 @@
 use std::{
+    collections::{HashMap, HashSet},
     env,
     error::Error,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -6,17 +7,72 @@ use std::{
 
 use aws_sdk_s3::{
     Client,
-    config::{BehaviorVersion, Credentials, Region, RequestChecksumCalculation},
+    config::{
+        BehaviorVersion, Credentials, Region, RequestChecksumCalculation, http::HttpResponse,
+    },
+    error::SdkError,
+    operation::{get_object::GetObjectOutput, head_object::HeadObjectOutput},
     primitives::ByteStream,
+    types::{CompletedMultipartUpload, CompletedPart, Object},
 };
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::http::Uri;
-use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
+// A published file has a marker at hokan/{id}. The marker is written when the upload completes,
+// so the link's lifetime starts then. Its ciphertext is uploaded in parts to hokan/data/{id}.
+// Files from before resumable uploads keep their ciphertext in the marker itself.
 const PREFIX: &str = "hokan/";
+const DATA_PREFIX: &str = "hokan/data/";
 const EXPIRES_METADATA: &str = "expires-at";
+const LIFETIME_METADATA: &str = "lifetime";
+const READ_TIMEOUT: Duration = Duration::from_secs(60);
 type StorageError = Box<dyn Error + Send + Sync>;
+
+pub enum CloudError {
+    NotFound,
+    Failed(StorageError),
+}
+
+impl CloudError {
+    fn failed(message: &str) -> Self {
+        Self::Failed(message.into())
+    }
+}
+
+impl<E: Error + Send + Sync + 'static> From<SdkError<E, HttpResponse>> for CloudError {
+    fn from(error: SdkError<E, HttpResponse>) -> Self {
+        if is_not_found(&error) {
+            Self::NotFound
+        } else {
+            Self::Failed(Box::new(error))
+        }
+    }
+}
+
+pub struct Part {
+    pub number: u32,
+    pub size: u64,
+    etag: Option<String>,
+}
+
+fn marker_key(id: Uuid) -> String {
+    format!("{PREFIX}{id}")
+}
+
+fn data_key(id: Uuid) -> String {
+    format!("{DATA_PREFIX}{id}")
+}
+
+fn is_not_found<E>(error: &SdkError<E, HttpResponse>) -> bool {
+    error
+        .raw_response()
+        .is_some_and(|response| response.status().as_u16() == 404)
+}
+
+fn now_seconds() -> Result<u64, StorageError> {
+    Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
+}
 
 fn validate_endpoint(endpoint: &str) -> Result<(), StorageError> {
     let uri: Uri = endpoint.parse()?;
@@ -38,10 +94,64 @@ fn is_expired(value: Option<&String>) -> Result<bool, StorageError> {
         Some("never") => Ok(false),
         Some(value) => {
             let expires = value.parse::<u64>()?;
-            Ok(expires <= SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
+            Ok(expires <= now_seconds()?)
         }
         None => Err("Stored object has missing expiry metadata".into()),
     }
+}
+
+fn lifetime_value(lifetime: Option<Duration>) -> String {
+    lifetime.map_or_else(
+        || "never".to_owned(),
+        |lifetime| lifetime.as_secs().to_string(),
+    )
+}
+
+fn parse_lifetime(value: Option<&String>) -> Result<Option<Duration>, CloudError> {
+    match value.map(String::as_str) {
+        Some("never") => Ok(None),
+        Some(value) => value
+            .parse()
+            .map(|seconds| Some(Duration::from_secs(seconds)))
+            .map_err(|_| CloudError::failed("Stored object has invalid lifetime metadata")),
+        None => Err(CloudError::failed(
+            "Stored object has missing lifetime metadata",
+        )),
+    }
+}
+
+// Streams an object's body, which must be `length` bytes long.
+fn stream_object(object: GetObjectOutput, length: u64) -> Result<Body, StorageError> {
+    if object.content_length() != i64::try_from(length).ok() {
+        return Err("Stored object has an unexpected length".into());
+    }
+    let stream = futures_util::stream::try_unfold(
+        (object.body, 0),
+        move |(mut body, received): (ByteStream, u64)| async move {
+            let next = tokio::time::timeout(READ_TIMEOUT, body.try_next())
+                .await
+                .map_err(|_| -> StorageError { "Cloud download stalled".into() })??;
+            let Some(bytes) = next else {
+                if received != length {
+                    return Err("Stored object ended early".into());
+                }
+                return Ok(None);
+            };
+            let received = received + bytes.len() as u64;
+            // Do not trust Content-Length alone: a misbehaving endpoint may stream more bytes.
+            if received > length {
+                return Err::<_, StorageError>("Stored object exceeds its length".into());
+            }
+            Ok(Some((bytes, (body, received))))
+        },
+    );
+    Ok(Body::from_stream(stream))
+}
+
+// The ciphertext of a published file.
+pub struct CloudFile {
+    key: String,
+    pub size: u64,
 }
 
 #[derive(Clone)]
@@ -91,129 +201,253 @@ impl CloudStore {
         })
     }
 
-    pub async fn put(
+    // Returns the multipart upload ID.
+    pub async fn create_upload(
         &self,
         id: Uuid,
-        bytes: Bytes,
         lifetime: Option<Duration>,
-    ) -> Result<(), StorageError> {
-        let expires = match lifetime {
-            Some(lifetime) => (SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()
-                + lifetime.as_secs())
-            .to_string(),
-            None => "never".to_owned(),
-        };
-        self.client
-            .put_object()
+    ) -> Result<String, CloudError> {
+        let created = self
+            .client
+            .create_multipart_upload()
             .bucket(&self.bucket)
-            .key(format!("{PREFIX}{id}"))
+            .key(data_key(id))
             .content_type("application/octet-stream")
-            .metadata(EXPIRES_METADATA, expires)
+            .metadata(LIFETIME_METADATA, lifetime_value(lifetime))
+            .send()
+            .await?;
+        Ok(created
+            .upload_id()
+            .ok_or_else(|| CloudError::failed("Storage did not return a multipart upload ID"))?
+            .to_owned())
+    }
+
+    pub async fn upload_part(
+        &self,
+        id: Uuid,
+        upload_id: &str,
+        number: u32,
+        bytes: Bytes,
+    ) -> Result<(), CloudError> {
+        self.client
+            .upload_part()
+            .bucket(&self.bucket)
+            .key(data_key(id))
+            .upload_id(upload_id)
+            .part_number(i32::try_from(number).map_err(|_| CloudError::NotFound)?)
             .body(ByteStream::from(bytes))
             .send()
             .await?;
         Ok(())
     }
 
-    pub async fn get(&self, id: Uuid, max_bytes: usize) -> Result<Option<Bytes>, StorageError> {
-        let key = format!("{PREFIX}{id}");
-        let response = match self
-            .client
-            .get_object()
+    pub async fn list_parts(&self, id: Uuid, upload_id: &str) -> Result<Vec<Part>, CloudError> {
+        let mut parts = Vec::new();
+        let mut marker = None;
+        loop {
+            let page = self
+                .client
+                .list_parts()
+                .bucket(&self.bucket)
+                .key(data_key(id))
+                .upload_id(upload_id)
+                .set_part_number_marker(marker)
+                .send()
+                .await?;
+            for part in page.parts() {
+                let (Some(number), Some(size)) = (
+                    part.part_number()
+                        .and_then(|number| u32::try_from(number).ok()),
+                    part.size().and_then(|size| u64::try_from(size).ok()),
+                ) else {
+                    continue;
+                };
+                parts.push(Part {
+                    number,
+                    size,
+                    etag: part.e_tag().map(str::to_owned),
+                });
+            }
+            if page.is_truncated() != Some(true) {
+                return Ok(parts);
+            }
+            marker = Some(
+                page.next_part_number_marker()
+                    .ok_or_else(|| CloudError::failed("Missing S3 part number marker"))?
+                    .to_owned(),
+            );
+        }
+    }
+
+    pub async fn complete_upload(
+        &self,
+        id: Uuid,
+        upload_id: &str,
+        parts: &[Part],
+    ) -> Result<(), CloudError> {
+        let parts = parts
+            .iter()
+            .map(|part| {
+                Ok(CompletedPart::builder()
+                    .part_number(i32::try_from(part.number).map_err(|_| CloudError::NotFound)?)
+                    .set_e_tag(part.etag.clone())
+                    .build())
+            })
+            .collect::<Result<Vec<_>, CloudError>>()?;
+        self.client
+            .complete_multipart_upload()
             .bucket(&self.bucket)
-            .key(&key)
+            .key(data_key(id))
+            .upload_id(upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .set_parts(Some(parts))
+                    .build(),
+            )
+            .send()
+            .await?;
+        Ok(())
+    }
+
+    pub async fn abort_upload(&self, id: Uuid, upload_id: &str) -> Result<(), CloudError> {
+        match self
+            .client
+            .abort_multipart_upload()
+            .bucket(&self.bucket)
+            .key(data_key(id))
+            .upload_id(upload_id)
             .send()
             .await
         {
-            Ok(response) => response,
-            Err(error)
-                if error
-                    .raw_response()
-                    .is_some_and(|response| response.status().as_u16() == 404) =>
-            {
-                return Ok(None);
+            Ok(_) => Ok(()),
+            Err(error) => match CloudError::from(error) {
+                CloudError::NotFound => Ok(()),
+                CloudError::Failed(error) => Err(CloudError::Failed(error)),
+            },
+        }
+    }
+
+    async fn metadata(&self, key: &str) -> Result<HashMap<String, String>, CloudError> {
+        let head = self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await?;
+        Ok(head.metadata().cloned().unwrap_or_default())
+    }
+
+    // Writes the marker for an upload that has completed, or reads it back if it exists
+    // already. Returns the lifetime chosen when the upload started.
+    pub async fn publish(&self, id: Uuid) -> Result<Option<Duration>, CloudError> {
+        match self.metadata(&marker_key(id)).await {
+            Ok(metadata) => return parse_lifetime(metadata.get(LIFETIME_METADATA)),
+            Err(CloudError::NotFound) => {}
+            Err(error) => return Err(error),
+        }
+        let lifetime = parse_lifetime(self.metadata(&data_key(id)).await?.get(LIFETIME_METADATA))?;
+        let expires = match lifetime {
+            Some(lifetime) => {
+                (now_seconds().map_err(CloudError::Failed)? + lifetime.as_secs()).to_string()
             }
-            Err(error) => return Err(Box::new(error)),
+            None => "never".to_owned(),
+        };
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(marker_key(id))
+            .content_type("application/octet-stream")
+            .metadata(EXPIRES_METADATA, expires)
+            .metadata(LIFETIME_METADATA, lifetime_value(lifetime))
+            .body(ByteStream::from_static(b""))
+            .send()
+            .await?;
+        Ok(lifetime)
+    }
+
+    async fn head(&self, key: &str) -> Result<Option<HeadObjectOutput>, StorageError> {
+        match self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(head) => Ok(Some(head)),
+            Err(error) if is_not_found(&error) => Ok(None),
+            Err(error) => Err(Box::new(error)),
+        }
+    }
+
+    // Finds the ciphertext of a published file that has not expired.
+    pub async fn open(&self, id: Uuid, max_bytes: u64) -> Result<Option<CloudFile>, StorageError> {
+        let Some(marker) = self.head(&marker_key(id)).await? else {
+            return Ok(None);
         };
         if is_expired(
-            response
+            marker
                 .metadata()
                 .and_then(|metadata| metadata.get(EXPIRES_METADATA)),
         )? {
             return Ok(None);
         }
-        if response.content_length().is_none_or(|length| {
-            usize::try_from(length)
-                .ok()
-                .is_none_or(|length| length > max_bytes)
-        }) {
-            return Err(
-                "Stored object exceeds the maximum allowed size or has no content length".into(),
-            );
-        }
-        // Do not trust Content-Length alone: a misbehaving endpoint may stream more bytes.
-        let mut reader = response.body.into_async_read().take(max_bytes as u64 + 1);
-        let mut bytes = Vec::new();
-        reader.read_to_end(&mut bytes).await?;
-        if bytes.len() > max_bytes {
-            return Err("Stored object exceeds the maximum allowed size".into());
-        }
-        Ok(Some(Bytes::from(bytes)))
+        let (key, head) = if marker.content_length() == Some(0) {
+            let key = data_key(id);
+            let Some(head) = self.head(&key).await? else {
+                return Ok(None);
+            };
+            (key, head)
+        } else {
+            (marker_key(id), marker)
+        };
+        let size = head
+            .content_length()
+            .and_then(|length| u64::try_from(length).ok())
+            .filter(|length| *length > 0 && *length <= max_bytes)
+            .ok_or("Stored object exceeds the maximum allowed size or has no content length")?;
+        Ok(Some(CloudFile { key, size }))
     }
 
-    // Only touch objects in Hokan's namespace with a UUID name. S3 ListObjects returns
-    // the last modification time, so cleanup remains possible after a server restart.
-    pub async fn cleanup(&self, lifetime: Duration) -> Result<(), StorageError> {
-        let cutoff = SystemTime::now()
-            .duration_since(UNIX_EPOCH)?
-            .as_secs()
-            .saturating_sub(lifetime.as_secs());
+    // Streams bytes `start` to `end` of a file, inclusive.
+    pub async fn read(
+        &self,
+        file: &CloudFile,
+        start: u64,
+        end: u64,
+    ) -> Result<Option<Body>, StorageError> {
+        let mut request = self.client.get_object().bucket(&self.bucket).key(&file.key);
+        if start > 0 || end + 1 < file.size {
+            request = request.range(format!("bytes={start}-{end}"));
+        }
+        match request.send().await {
+            Ok(object) => stream_object(object, end - start + 1).map(Some),
+            Err(error) if is_not_found(&error) => Ok(None),
+            Err(error) => Err(Box::new(error)),
+        }
+    }
+
+    async fn list(
+        &self,
+        prefix: &str,
+        delimiter: Option<&str>,
+    ) -> Result<Vec<Object>, StorageError> {
+        let mut objects = Vec::new();
         let mut token = None;
         loop {
             let page = self
                 .client
                 .list_objects_v2()
                 .bucket(&self.bucket)
-                .prefix(PREFIX)
+                .prefix(prefix)
+                .set_delimiter(delimiter.map(str::to_owned))
                 .set_continuation_token(token)
                 .send()
                 .await?;
-            for object in page.contents() {
-                let Some(key) = object.key() else { continue };
-                if key
-                    .strip_prefix(PREFIX)
-                    .and_then(|s| Uuid::parse_str(s).ok())
-                    .is_none()
-                {
-                    continue;
-                }
-                if object
-                    .last_modified()
-                    .is_some_and(|time| u64::try_from(time.secs()).is_ok_and(|secs| secs <= cutoff))
-                {
-                    let head = self
-                        .client
-                        .head_object()
-                        .bucket(&self.bucket)
-                        .key(key)
-                        .send()
-                        .await?;
-                    if !is_expired(
-                        head.metadata()
-                            .and_then(|metadata| metadata.get(EXPIRES_METADATA)),
-                    )? {
-                        continue;
-                    }
-                    self.client
-                        .delete_object()
-                        .bucket(&self.bucket)
-                        .key(key)
-                        .send()
-                        .await?;
-                }
-            }
+            objects.extend_from_slice(page.contents());
             if page.is_truncated() != Some(true) {
-                break;
+                return Ok(objects);
             }
             token = Some(
                 page.next_continuation_token()
@@ -221,109 +455,361 @@ impl CloudStore {
                     .to_owned(),
             );
         }
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), StorageError> {
+        self.client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await?;
         Ok(())
+    }
+
+    // Only touches objects in Hokan's namespace with a UUID name. S3 listings include each
+    // object's last modification time, so cleanup still works after a server restart.
+    pub async fn cleanup(
+        &self,
+        min_lifetime: Duration,
+        upload_lifetime: Duration,
+    ) -> Result<(), StorageError> {
+        let now = now_seconds()?;
+        let older_than = |time: Option<&aws_sdk_s3::primitives::DateTime>, age: Duration| {
+            time.is_some_and(|time| {
+                u64::try_from(time.secs())
+                    .is_ok_and(|secs| secs <= now.saturating_sub(age.as_secs()))
+            })
+        };
+        let mut published = HashSet::new();
+        for object in self.list(PREFIX, Some("/")).await? {
+            let Some(key) = object.key() else { continue };
+            let Some(id) = key
+                .strip_prefix(PREFIX)
+                .and_then(|s| Uuid::parse_str(s).ok())
+            else {
+                continue;
+            };
+            published.insert(id);
+            if !older_than(object.last_modified(), min_lifetime) {
+                continue;
+            }
+            let head = self
+                .client
+                .head_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .send()
+                .await?;
+            if is_expired(
+                head.metadata()
+                    .and_then(|metadata| metadata.get(EXPIRES_METADATA)),
+            )? {
+                // The ciphertext goes first, so the marker remains to find it if this fails.
+                self.delete(&data_key(id)).await?;
+                self.delete(key).await?;
+            }
+        }
+        // Ciphertext from an upload that completed but whose marker was never written.
+        for object in self.list(DATA_PREFIX, None).await? {
+            let Some(key) = object.key() else { continue };
+            let Some(id) = key
+                .strip_prefix(DATA_PREFIX)
+                .and_then(|s| Uuid::parse_str(s).ok())
+            else {
+                continue;
+            };
+            if !published.contains(&id) && older_than(object.last_modified(), upload_lifetime * 2) {
+                self.delete(key).await?;
+            }
+        }
+        // Uploads that were started but never completed.
+        let (mut key_marker, mut upload_id_marker) = (None, None);
+        loop {
+            let page = self
+                .client
+                .list_multipart_uploads()
+                .bucket(&self.bucket)
+                .prefix(DATA_PREFIX)
+                .set_key_marker(key_marker)
+                .set_upload_id_marker(upload_id_marker)
+                .send()
+                .await?;
+            for upload in page.uploads() {
+                if let (Some(key), Some(upload_id)) = (upload.key(), upload.upload_id())
+                    && older_than(upload.initiated(), upload_lifetime)
+                {
+                    self.client
+                        .abort_multipart_upload()
+                        .bucket(&self.bucket)
+                        .key(key)
+                        .upload_id(upload_id)
+                        .send()
+                        .await?;
+                }
+            }
+            if page.is_truncated() != Some(true) {
+                return Ok(());
+            }
+            key_marker = page.next_key_marker().map(str::to_owned);
+            upload_id_marker = page.next_upload_id_marker().map(str::to_owned);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tests::{complete, download, json, part, send, small_parts, start, upload};
     use axum::{
         Router,
-        body::{Body, to_bytes},
+        body::to_bytes,
         extract::State,
         http::{Request, StatusCode, header},
         response::Response,
     };
+    use http_body_util::BodyExt;
     use std::{
         collections::BTreeMap,
+        fmt::Write as _,
         sync::{Arc, Mutex},
     };
 
     #[derive(Clone)]
     struct Object {
         bytes: Bytes,
-        expires: String,
+        metadata: Vec<(String, String)>,
     }
-    type Objects = Arc<Mutex<BTreeMap<String, Object>>>;
 
-    async fn mock_s3(State(objects): State<Objects>, request: Request<Body>) -> Response {
-        let method = request.method().clone();
+    struct Upload {
+        key: String,
+        metadata: Vec<(String, String)>,
+        parts: BTreeMap<u32, Bytes>,
+    }
+
+    #[derive(Default)]
+    struct Bucket {
+        objects: BTreeMap<String, Object>,
+        uploads: BTreeMap<String, Upload>,
+    }
+    type Shared = Arc<Mutex<Bucket>>;
+
+    fn query_value<'a>(query: &'a str, name: &str) -> Option<&'a str> {
+        query.split('&').find_map(|part| {
+            let (key, value) = part.split_once('=').unwrap_or((part, ""));
+            (key == name).then_some(value)
+        })
+    }
+
+    fn reply(status: u16, body: impl Into<Body>) -> Response {
+        Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, "application/xml")
+            .body(body.into())
+            .unwrap()
+    }
+
+    fn no_such_upload() -> Response {
+        reply(404, "<Error><Code>NoSuchUpload</Code></Error>")
+    }
+
+    // Lists one object per page, so that pagination is exercised.
+    fn list_objects(bucket: &Bucket, query: &str) -> Response {
+        let decode = |value: &str| value.replace("%2F", "/");
+        let prefix = query_value(query, "prefix").map(decode).unwrap_or_default();
+        let delimiter = query_value(query, "delimiter").map(decode);
+        let skip: usize =
+            query_value(query, "continuation-token").map_or(0, |t| t.parse().unwrap());
+        let keys: Vec<&String> = bucket
+            .objects
+            .keys()
+            .filter(|key| {
+                key.strip_prefix(&prefix).is_some_and(|rest| {
+                    delimiter
+                        .as_deref()
+                        .is_none_or(|delimiter| !rest.contains(delimiter))
+                })
+            })
+            .collect();
+        let more = keys.len() > skip + 1;
+        let mut body = format!("<ListBucketResult><IsTruncated>{more}</IsTruncated>");
+        if let Some(key) = keys.get(skip) {
+            let _ = write!(
+                body,
+                "<Contents><Key>{key}</Key><LastModified>2000-01-01T00:00:00.000Z</LastModified><Size>1</Size></Contents>"
+            );
+        }
+        if more {
+            let _ = write!(
+                body,
+                "<NextContinuationToken>{}</NextContinuationToken>",
+                skip + 1
+            );
+        }
+        body.push_str("</ListBucketResult>");
+        reply(200, body)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn mock_s3(State(bucket): State<Shared>, request: Request<Body>) -> Response {
+        let method = request.method().as_str().to_owned();
         let path = request.uri().path().to_owned();
         let query = request.uri().query().unwrap_or("").to_owned();
         if path.starts_with("/error/") {
-            return Response::builder().status(500).body(Body::empty()).unwrap();
+            return reply(500, "");
         }
-        if path == "/test-bucket/" && method == "GET" {
-            let after = query
-                .split('&')
-                .find_map(|part| part.strip_prefix("continuation-token="));
-            let objects = objects.lock().unwrap();
-            let mut entries = objects.keys().filter(|key| {
-                after.is_none_or(|after| key.strip_prefix(PREFIX).unwrap_or(key) > after)
-            });
-            let entry = entries.next().cloned();
-            let more = entries.next().is_some();
-            let contents = entry.as_ref().map(|key| format!("<Contents><Key>{key}</Key><LastModified>2000-01-01T00:00:00.000Z</LastModified><Size>1</Size></Contents>")).unwrap_or_default();
-            let token = if more {
-                format!(
-                    "<NextContinuationToken>{}</NextContinuationToken>",
-                    entry.unwrap().strip_prefix(PREFIX).unwrap_or("")
-                )
-            } else {
-                String::new()
-            };
-            let xml = format!(
-                "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><IsTruncated>{more}</IsTruncated>{contents}{token}</ListBucketResult>"
-            );
-            return Response::builder()
-                .header(header::CONTENT_TYPE, "application/xml")
-                .body(Body::from(xml))
-                .unwrap();
-        }
-        let Some(key) = path.strip_prefix("/test-bucket/") else {
-            return Response::builder().status(404).body(Body::empty()).unwrap();
+        let Some(key) = path.strip_prefix("/test-bucket/").map(str::to_owned) else {
+            return reply(404, "");
         };
-        let key = key.to_owned();
-        match method.as_str() {
-            "PUT" => {
-                let expires = request
-                    .headers()
-                    .get("x-amz-meta-expires-at")
-                    .unwrap()
-                    .to_str()
-                    .unwrap()
-                    .to_owned();
-                let bytes = to_bytes(request.into_body(), 1024).await.unwrap();
-                objects
-                    .lock()
-                    .unwrap()
-                    .insert(key, Object { bytes, expires });
-                Response::builder().status(200).body(Body::empty()).unwrap()
+        let metadata: Vec<(String, String)> = request
+            .headers()
+            .iter()
+            .filter_map(|(name, value)| {
+                Some((
+                    name.as_str().strip_prefix("x-amz-meta-")?.to_owned(),
+                    value.to_str().ok()?.to_owned(),
+                ))
+            })
+            .collect();
+        let range = request
+            .headers()
+            .get(header::RANGE)
+            .map(|value| value.to_str().unwrap().to_owned());
+        let body = to_bytes(request.into_body(), 1 << 20).await.unwrap();
+        let mut bucket = bucket.lock().unwrap();
+        if key.is_empty() {
+            if query_value(&query, "uploads").is_none() {
+                return list_objects(&bucket, &query);
             }
-            "GET" | "HEAD" => {
-                let object = objects.lock().unwrap().get(&key).cloned();
-                match object {
-                    Some(object) => Response::builder()
-                        .header("x-amz-meta-expires-at", object.expires)
-                        .header(header::CONTENT_LENGTH, object.bytes.len())
-                        .body(if method == "HEAD" {
-                            Body::empty()
-                        } else {
-                            Body::from(object.bytes)
-                        })
-                        .unwrap(),
-                    None => Response::builder()
-                        .status(StatusCode::NOT_FOUND)
-                        .body(Body::from("<Error><Code>NoSuchKey</Code></Error>"))
-                        .unwrap(),
+            let mut body = String::from(
+                "<ListMultipartUploadsResult><Bucket>test-bucket</Bucket><IsTruncated>false</IsTruncated>",
+            );
+            for (upload_id, upload) in &bucket.uploads {
+                let _ = write!(
+                    body,
+                    "<Upload><Key>{}</Key><UploadId>{upload_id}</UploadId><Initiated>2000-01-01T00:00:00.000Z</Initiated></Upload>",
+                    upload.key
+                );
+            }
+            body.push_str("</ListMultipartUploadsResult>");
+            return reply(200, body);
+        }
+        match (method.as_str(), query_value(&query, "uploadId")) {
+            ("POST", None) => {
+                let upload_id = Uuid::new_v4().to_string();
+                bucket.uploads.insert(
+                    upload_id.clone(),
+                    Upload {
+                        key: key.clone(),
+                        metadata,
+                        parts: BTreeMap::new(),
+                    },
+                );
+                reply(
+                    200,
+                    format!(
+                        "<InitiateMultipartUploadResult><Bucket>test-bucket</Bucket><Key>{key}</Key><UploadId>{upload_id}</UploadId></InitiateMultipartUploadResult>"
+                    ),
+                )
+            }
+            ("PUT", Some(upload_id)) => {
+                let number = query_value(&query, "partNumber").unwrap().parse().unwrap();
+                let Some(upload) = bucket.uploads.get_mut(upload_id) else {
+                    return no_such_upload();
+                };
+                upload.parts.insert(number, body);
+                Response::builder()
+                    .header(header::ETAG, format!("\"etag-{number}\""))
+                    .body(Body::empty())
+                    .unwrap()
+            }
+            ("GET", Some(upload_id)) => {
+                let Some(upload) = bucket.uploads.get(upload_id) else {
+                    return no_such_upload();
+                };
+                let mut body = format!(
+                    "<ListPartsResult><Bucket>test-bucket</Bucket><Key>{key}</Key><UploadId>{upload_id}</UploadId><IsTruncated>false</IsTruncated>"
+                );
+                for (number, bytes) in &upload.parts {
+                    let _ = write!(
+                        body,
+                        "<Part><PartNumber>{number}</PartNumber><ETag>\"etag-{number}\"</ETag><Size>{}</Size></Part>",
+                        bytes.len()
+                    );
                 }
+                body.push_str("</ListPartsResult>");
+                reply(200, body)
             }
-            "DELETE" => {
-                objects.lock().unwrap().remove(&key);
-                Response::builder().status(204).body(Body::empty()).unwrap()
+            ("POST", Some(upload_id)) => {
+                let Some(upload) = bucket.uploads.remove(upload_id) else {
+                    return no_such_upload();
+                };
+                let bytes = upload.parts.into_values().flatten().collect::<Vec<u8>>();
+                bucket.objects.insert(
+                    upload.key,
+                    Object {
+                        bytes: bytes.into(),
+                        metadata: upload.metadata,
+                    },
+                );
+                reply(
+                    200,
+                    format!(
+                        "<CompleteMultipartUploadResult><Bucket>test-bucket</Bucket><Key>{key}</Key><ETag>\"done\"</ETag></CompleteMultipartUploadResult>"
+                    ),
+                )
             }
-            _ => Response::builder().status(405).body(Body::empty()).unwrap(),
+            ("DELETE", Some(upload_id)) => match bucket.uploads.remove(upload_id) {
+                Some(_) => reply(204, ""),
+                None => no_such_upload(),
+            },
+            ("PUT", None) => {
+                bucket.objects.insert(
+                    key,
+                    Object {
+                        bytes: body,
+                        metadata,
+                    },
+                );
+                reply(200, "")
+            }
+            ("GET" | "HEAD", None) => {
+                let Some(object) = bucket.objects.get(&key) else {
+                    return reply(404, "<Error><Code>NoSuchKey</Code></Error>");
+                };
+                let range = range.and_then(|range| {
+                    let (start, end) = range.strip_prefix("bytes=")?.split_once('-')?;
+                    Some((start.parse::<usize>().ok()?, end.parse::<usize>().ok()?))
+                });
+                if let Some((start, end)) = range {
+                    return Response::builder()
+                        .status(206)
+                        .header(
+                            header::CONTENT_RANGE,
+                            format!("bytes {start}-{end}/{}", object.bytes.len()),
+                        )
+                        .header(header::CONTENT_LENGTH, end - start + 1)
+                        .body(Body::from(object.bytes.slice(start..=end)))
+                        .unwrap();
+                }
+                let mut response =
+                    Response::builder().header(header::CONTENT_LENGTH, object.bytes.len());
+                for (name, value) in &object.metadata {
+                    response = response.header(format!("x-amz-meta-{name}"), value);
+                }
+                response
+                    .body(if method == "HEAD" {
+                        Body::empty()
+                    } else {
+                        Body::from(object.bytes.clone())
+                    })
+                    .unwrap()
+            }
+            ("DELETE", None) => {
+                bucket.objects.remove(&key);
+                reply(204, "")
+            }
+            _ => reply(405, ""),
         }
     }
 
@@ -342,6 +828,25 @@ mod tests {
         }
     }
 
+    async fn start_mock() -> (String, Shared, tokio::task::JoinHandle<()>) {
+        let bucket: Shared = Arc::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let app = Router::new().fallback(mock_s3).with_state(bucket.clone());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (endpoint, bucket, task)
+    }
+
+    async fn read(store: &CloudStore, id: Uuid) -> Option<Bytes> {
+        let file = store.open(id, 100).await.unwrap()?;
+        let body = store.read(&file, 0, file.size - 1).await.unwrap()?;
+        Some(body.collect().await.unwrap().to_bytes())
+    }
+
+    fn cloud_api(store: &CloudStore) -> Router {
+        crate::api(crate::Store::Cloud(store.clone()), small_parts())
+    }
+
     #[test]
     fn cloud_endpoint_requires_https_and_no_embedded_credentials() {
         assert!(validate_endpoint("https://s3.example.com").is_ok());
@@ -351,75 +856,147 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cloud_round_trip_restart_expiry_cleanup_and_errors() {
-        let objects: Objects = Arc::new(Mutex::new(BTreeMap::new()));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let app = Router::new().fallback(mock_s3).with_state(objects.clone());
-        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    async fn cloud_uploads_resume_complete_once_and_publish_when_done() {
+        let (endpoint, bucket, task) = start_mock().await;
         let store = client(&endpoint, "test-bucket");
-        let live = Uuid::new_v4();
-        let expired1 = Uuid::new_v4();
-        let expired2 = Uuid::new_v4();
-        store
-            .put(
-                live,
-                Bytes::from_static(b"ciphertext"),
-                Some(Duration::from_hours(24)),
-            )
-            .await
-            .unwrap();
-        store
-            .put(expired1, Bytes::from_static(b"old"), Some(Duration::ZERO))
-            .await
-            .unwrap();
-        store
-            .put(expired2, Bytes::from_static(b"old"), Some(Duration::ZERO))
-            .await
-            .unwrap();
-        let permanent = Uuid::new_v4();
-        store
-            .put(permanent, Bytes::from_static(b"permanent"), None)
-            .await
-            .unwrap();
-        let restarted = client(&endpoint, "test-bucket");
-        assert_eq!(
-            restarted.get(live, 100).await.unwrap().unwrap(),
-            "ciphertext"
-        );
-        assert!(restarted.get(expired1, 100).await.unwrap().is_none());
-        assert!(restarted.get(Uuid::new_v4(), 100).await.unwrap().is_none());
-        assert!(restarted.get(live, 1).await.is_err());
-        restarted.cleanup(Duration::from_hours(24)).await.unwrap();
-        assert!(restarted.get(live, 100).await.unwrap().is_some());
-        assert_eq!(
-            restarted.get(permanent, 100).await.unwrap().unwrap(),
-            "permanent"
-        );
-        assert!(
-            !objects
-                .lock()
+        let app = cloud_api(&store);
+        let token = start(&app, 10, Some("3600")).await;
+        for (number, bytes) in [(2, "efgh"), (1, "abcd")] {
+            let (status, _, _) = send(&app, part(&token, number, bytes.as_bytes())).await;
+            assert_eq!(status, StatusCode::NO_CONTENT);
+        }
+        // A restarted server finds the upload from its token alone.
+        let app = cloud_api(&client(&endpoint, "test-bucket"));
+        let (_, _, body) = send(&app, crate::tests::status(&token)).await;
+        assert_eq!(json(&body)["received"], serde_json::json!([1, 2]));
+        let (status, _, _) = send(&app, complete(&token)).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        send(&app, part(&token, 3, b"ij")).await;
+        let (status, _, body) = send(&app, complete(&token)).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(json(&body)["expires_in_seconds"], 3600);
+        let id = json(&body)["id"].as_str().unwrap().to_owned();
+        let uuid = Uuid::parse_str(&id).unwrap();
+        {
+            let bucket = bucket.lock().unwrap();
+            assert!(bucket.uploads.is_empty());
+            let marker = &bucket.objects[&marker_key(uuid)];
+            assert!(marker.bytes.is_empty());
+            let expires: u64 = marker
+                .metadata
+                .iter()
+                .find(|(name, _)| name == EXPIRES_METADATA)
                 .unwrap()
-                .contains_key(&format!("{PREFIX}{expired1}"))
-        );
-        assert!(
-            !objects
-                .lock()
-                .unwrap()
-                .contains_key(&format!("{PREFIX}{expired2}"))
-        );
+                .1
+                .parse()
+                .unwrap();
+            assert!(expires > now_seconds().unwrap() + 3500);
+        }
+        // Repeating the request after a lost reply returns the same file.
+        let (status, _, body) = send(&app, complete(&token)).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(json(&body)["id"], id.as_str());
+        // Cancelling a completed upload leaves the file in place.
+        let request = Request::delete(format!("/api/uploads/{token}"))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _, _) = send(&app, request).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (code, headers, body) = send(&app, download(&id)).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(headers[header::CONTENT_LENGTH], "10");
+        assert_eq!(body, "abcdefghij");
+        let request = Request::get(format!("/api/files/{id}"))
+            .header(header::RANGE, "bytes=4-")
+            .body(Body::empty())
+            .unwrap();
+        let (code, headers, body) = send(&app, request).await;
+        assert_eq!(code, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(headers[header::CONTENT_RANGE], "bytes 4-9/10");
+        assert_eq!(body, "efghij");
+        let (code, _, _) = send(&app, crate::tests::status(&token)).await;
+        assert_eq!(code, StatusCode::NOT_FOUND);
+
+        let cancelled = start(&app, 8, None).await;
+        send(&app, part(&cancelled, 1, b"abcd")).await;
+        let request = Request::delete(format!("/api/uploads/{cancelled}"))
+            .body(Body::empty())
+            .unwrap();
+        send(&app, request).await;
+        assert!(bucket.lock().unwrap().uploads.is_empty());
+        let (status, _, _) = send(&app, part(&cancelled, 2, b"efgh")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn cloud_reads_old_files_and_cleans_up_expired_and_abandoned_ones() {
+        let (endpoint, bucket, task) = start_mock().await;
+        let store = client(&endpoint, "test-bucket");
+        let app = cloud_api(&store);
+        let object = |bytes: &'static [u8], expires: &str| Object {
+            bytes: Bytes::from_static(bytes),
+            metadata: vec![(EXPIRES_METADATA.to_owned(), expires.to_owned())],
+        };
+        let (legacy, old_legacy) = (Uuid::new_v4(), Uuid::new_v4());
+        bucket.lock().unwrap().objects.extend([
+            (marker_key(legacy), object(b"legacy", "never")),
+            (marker_key(old_legacy), object(b"old", "1")),
+        ]);
+        let live = Uuid::parse_str(&upload(&app, b"live data", Some("0")).await).unwrap();
+        let expired = Uuid::parse_str(&upload(&app, b"expired", None).await).unwrap();
+        bucket
+            .lock()
+            .unwrap()
+            .objects
+            .get_mut(&marker_key(expired))
+            .unwrap()
+            .metadata = vec![(EXPIRES_METADATA.to_owned(), "1".to_owned())];
+        // Completed, but the server stopped before writing the marker.
+        let orphan = Uuid::new_v4();
+        let upload_id = store.create_upload(orphan, None).await.ok().unwrap();
+        store
+            .upload_part(orphan, &upload_id, 1, Bytes::from_static(b"lost"))
+            .await
+            .ok()
+            .unwrap();
+        let parts = store.list_parts(orphan, &upload_id).await.ok().unwrap();
+        store
+            .complete_upload(orphan, &upload_id, &parts)
+            .await
+            .ok()
+            .unwrap();
+        let abandoned = start(&app, 8, None).await;
+        send(&app, part(&abandoned, 1, b"abcd")).await;
+
+        assert_eq!(read(&store, legacy).await.unwrap(), "legacy");
+        assert!(read(&store, old_legacy).await.is_none());
+        assert_eq!(read(&store, live).await.unwrap(), "live data");
+        assert!(read(&store, expired).await.is_none());
+        assert!(read(&store, orphan).await.is_none());
+        assert!(store.open(live, 1).await.is_err());
+        let file = store.open(live, 100).await.unwrap().unwrap();
+        let body = store.read(&file, 2, 5).await.unwrap().unwrap();
+        assert_eq!(body.collect().await.unwrap().to_bytes(), "ve d");
+
+        store
+            .cleanup(Duration::from_hours(1), Duration::from_hours(24))
+            .await
+            .unwrap();
+        {
+            let bucket = bucket.lock().unwrap();
+            let mut keys: Vec<&String> = bucket.objects.keys().collect();
+            keys.sort();
+            let mut expected = [marker_key(legacy), marker_key(live), data_key(live)];
+            expected.sort();
+            assert_eq!(keys, expected.iter().collect::<Vec<_>>());
+            assert!(bucket.uploads.is_empty());
+        }
+        assert_eq!(read(&store, live).await.unwrap(), "live data");
+
         let error_store = client(&endpoint, "error");
-        assert!(error_store.get(live, 100).await.is_err());
-        assert!(
-            error_store
-                .put(
-                    live,
-                    Bytes::from_static(b"data"),
-                    Some(Duration::from_secs(1))
-                )
-                .await
-                .is_err()
-        );
+        assert!(error_store.open(live, 100).await.is_err());
+        assert!(error_store.create_upload(live, None).await.is_err());
         task.abort();
     }
 }

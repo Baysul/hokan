@@ -25,7 +25,9 @@ test "$(curl --fail --silent --show-error --retry 30 --retry-delay 1 --retry-all
 curl --fail --silent --show-error "$url/" | grep -q '<title>Hokan'
 
 printf 'container smoke test' > "$temp_dir/upload"
-id="$(curl --fail --silent --show-error -H 'Content-Type: application/octet-stream' --data-binary "@$temp_dir/upload" "$url/api/files" | jq -er '.id | select(type == "string" and test("^[0-9a-f-]+$"))')"
+upload="$(curl --fail --silent --show-error -X POST -H "X-Hokan-Upload-Length: $(wc -c < "$temp_dir/upload")" "$url/api/uploads" | jq -er '.upload | select(type == "string" and test("^[0-9a-f.-]+$"))')"
+curl --fail --silent --show-error -X PUT -H 'Content-Type: application/octet-stream' --data-binary "@$temp_dir/upload" "$url/api/uploads/$upload/parts/1"
+id="$(curl --fail --silent --show-error -X POST "$url/api/uploads/$upload/complete" | jq -er '.id | select(type == "string" and test("^[0-9a-f-]+$"))')"
 curl --fail --silent --show-error "$url/api/files/$id" > "$temp_dir/download"
 cmp "$temp_dir/upload" "$temp_dir/download"
 echo 'Docker image smoke test passed.'

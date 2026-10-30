@@ -426,6 +426,20 @@ select:focus-visible {
   line-height: 1.5;
   margin: 0 0 22px;
 }
+.resume-note {
+  background: var(--well);
+  border: 2px solid var(--gold);
+  margin: 0 0 16px;
+  padding: 12px 14px;
+}
+.resume-note p {
+  font-size: 13px;
+  line-height: 1.5;
+  margin: 0;
+}
+.resume-note .text-button {
+  padding-top: 8px;
+}
 .drop-zone {
   min-height: 184px;
   border: 2px dashed #3d5bb5;

@@ -3,13 +3,13 @@ import { readFile } from "node:fs/promises";
 
 test("encrypts a file, shares a link and downloads it in Firefox", async ({ browser, page }) => {
   const contents = Buffer.from("a secret message for Firefox ✨", "utf8");
-  let upload: Buffer | null = null;
+  const parts: Buffer[] = [];
   let expiry: string | undefined;
   page.on("request", (request) => {
-    if (request.method() === "POST" && request.url().endsWith("/api/files")) {
-      upload = request.postDataBuffer();
+    if (request.method() === "POST" && request.url().endsWith("/api/uploads"))
       expiry = request.headers()["x-hokan-expiry-seconds"];
-    }
+    const body = request.method() === "PUT" && request.postDataBuffer();
+    if (body) parts.push(body);
   });
   const homeResponse = await page.goto("/");
   expect(homeResponse?.headers()["content-security-policy"]).toContain("script-src 'self'");
@@ -24,10 +24,10 @@ test("encrypts a file, shares a link and downloads it in Firefox", async ({ brow
   await expect(linkInput).toBeVisible();
   const shareLink = await linkInput.inputValue();
   expect(shareLink).toMatch(/\/share\/[0-9a-f-]{36}#[A-Za-z0-9_-]{43}$/);
-  expect(upload).not.toBeNull();
+  expect(parts).toHaveLength(1);
   expect(expiry).toBe("3600");
-  expect(upload!.includes(contents)).toBe(false);
-  expect(upload!.includes(Buffer.from("secret.txt"))).toBe(false);
+  expect(parts[0]!.includes(contents)).toBe(false);
+  expect(parts[0]!.includes(Buffer.from("secret.txt"))).toBe(false);
 
   // A separate browser context models the recipient without sharing sender state.
   const recipient = await browser.newContext({ acceptDownloads: true });
@@ -55,7 +55,7 @@ test("encrypts a file, shares a link and downloads it in Firefox", async ({ brow
 test("creates a link that never expires and says so", async ({ page }) => {
   let expiry: string | undefined;
   page.on("request", (request) => {
-    if (request.method() === "POST" && request.url().endsWith("/api/files"))
+    if (request.method() === "POST" && request.url().endsWith("/api/uploads"))
       expiry = request.headers()["x-hokan-expiry-seconds"];
   });
   await page.goto("/");
@@ -70,8 +70,8 @@ test("creates a link that never expires and says so", async ({ page }) => {
 });
 
 test("explains why an upload failed instead of a generic error", async ({ page }) => {
-  await page.route("**/api/files", (route) =>
-    route.fulfill({ status: 503, contentType: "text/plain", body: "Storage capacity reached" }),
+  await page.route("**/api/uploads", (route) =>
+    route.fulfill({ status: 507, contentType: "text/plain", body: "Storage capacity reached" }),
   );
   await page.goto("/");
   await page

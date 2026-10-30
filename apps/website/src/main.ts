@@ -1,7 +1,8 @@
 import "./style.css";
 import "@hotwired/turbo";
 import { Application, Controller } from "@hotwired/stimulus";
-import { createShare, openShare, type ShareProgress } from "./share";
+import { MAX_FILE_SIZE, openShare } from "./share";
+import { createShare, discardPendingShare, pendingShare, type ShareProgress } from "./upload";
 import { brandMarkHtml, galaxyHtml, mascotHtml } from "./art";
 
 const paths: Record<string, string> = {
@@ -31,9 +32,10 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
         <div data-share-target="sendView">
           <h1>Share a file</h1>
           <p class="card-description">Choose a file to create an encrypted share link.</p>
+          <div class="resume-note" data-share-target="resumeNote" hidden><p data-share-target="resumeText"></p><button type="button" class="text-button" data-action="share#discard">Discard it</button></div>
           <div class="drop-zone" data-share-target="dropZone" data-action="dragover->share#dragOver dragleave->share#dragLeave drop->share#drop">
             <div class="upload-icon">${icon("upload", 25)}</div>
-            <strong>Drop a file here</strong><p>or</p><label class="browse-label" for="file-input">Browse files</label><span class="drop-hint">One file, up to 24 MiB</span>
+            <strong>Drop a file here</strong><p>or</p><label class="browse-label" for="file-input">Browse files</label><span class="drop-hint">One file, up to 5 GiB</span>
             <input id="file-input" class="sr-only" type="file" data-share-target="input" data-action="change->share#select" />
           </div>
           <div class="selected-file" data-share-target="selected" hidden><span class="selected-icon">${icon("file", 19)}</span><span class="file-detail"><strong data-share-target="fileName"></strong><small data-share-target="fileSize"></small></span><button type="button" aria-label="Remove selected file" data-share-target="removeButton" data-action="share#remove">${icon("x", 18)}</button><div class="progress" data-share-target="progress" role="progressbar" aria-label="Upload progress" aria-valuemin="0" aria-valuemax="100" hidden><div class="progress-fill" data-share-target="progressFill"></div></div></div>
@@ -49,11 +51,12 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
   </main>
 </div>`;
 
-const MAX_FILE_SIZE = 24 * 1024 * 1024;
 const formatSize = (bytes: number) =>
   bytes < 1024 * 1024
     ? `${(bytes / 1024).toFixed(1)} KiB`
-    : `${(bytes / 1024 / 1024).toFixed(1)} MiB`;
+    : bytes < 1024 * 1024 * 1024
+      ? `${(bytes / 1024 / 1024).toFixed(1)} MiB`
+      : `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GiB`;
 class ShareController extends Controller<HTMLElement> {
   static targets = [
     "input",
@@ -75,6 +78,8 @@ class ShareController extends Controller<HTMLElement> {
     "receiveStatus",
     "download",
     "status",
+    "resumeNote",
+    "resumeText",
   ];
   declare readonly inputTarget: HTMLInputElement;
   declare readonly expiryTarget: HTMLSelectElement;
@@ -95,22 +100,41 @@ class ShareController extends Controller<HTMLElement> {
   declare readonly receiveStatusTarget: HTMLElement;
   declare readonly downloadTarget: HTMLAnchorElement;
   declare readonly statusTarget: HTMLElement;
+  declare readonly resumeNoteTarget: HTMLElement;
+  declare readonly resumeTextTarget: HTMLElement;
   private file: File | null = null;
+  private sending: AbortController | null = null;
   private received: { blob: Blob; name: string } | null = null;
   private downloadUrl: string | null = null;
   private active = false;
   private readonly hashChanged = () => {
     if (location.pathname.startsWith("/share/")) location.reload();
   };
+  // Asks before the page closes during an upload. It could be resumed, but only by choosing
+  // the file again.
+  private readonly leaving = (event: BeforeUnloadEvent) => event.preventDefault();
 
   async connect() {
     this.active = true;
     window.addEventListener("hashchange", this.hashChanged);
-    if (!location.pathname.startsWith("/share/")) return;
+    if (!location.pathname.startsWith("/share/")) return this.showPending();
     this.sendViewTarget.hidden = true;
     this.receiveTarget.hidden = false;
     try {
-      this.received = await openShare();
+      this.received = await openShare((progress) => {
+        if (!this.active) return;
+        if (progress.stage === "reconnecting") {
+          const seconds = Math.max(1, Math.ceil((progress.retryAt - Date.now()) / 1000));
+          this.receiveStatusTarget.textContent = progress.offline
+            ? "You are offline. The download continues when you reconnect."
+            : `Connection problem. Retrying in ${seconds} s…`;
+          return;
+        }
+        const { loaded, total } = progress;
+        this.receiveStatusTarget.textContent = total
+          ? `Downloading and decrypting… ${Math.floor((loaded / total) * 100)}%`
+          : `Downloading and decrypting… ${formatSize(loaded)}`;
+      });
       if (!this.active) return;
       if (!this.received) throw new Error("This link is missing its decryption key.");
       this.receiveStatusTarget.textContent = `Ready to download: ${this.received.name}`;
@@ -126,8 +150,27 @@ class ShareController extends Controller<HTMLElement> {
   disconnect() {
     this.active = false;
     window.removeEventListener("hashchange", this.hashChanged);
+    window.removeEventListener("beforeunload", this.leaving);
+    this.sending?.abort();
     if (this.downloadUrl) URL.revokeObjectURL(this.downloadUrl);
     this.downloadUrl = null;
+  }
+  async showPending() {
+    const pending = await pendingShare();
+    if (!this.active || this.sending) return;
+    this.resumeNoteTarget.hidden = !pending;
+    if (!pending) return;
+    this.resumeTextTarget.textContent = `Your upload of “${pending.name}” (${formatSize(pending.size)}) was interrupted. Choose the same file again to continue where it stopped.`;
+    this.expiryTarget.value = String(pending.expirySeconds);
+  }
+  async discard() {
+    try {
+      await discardPendingShare();
+      this.resumeNoteTarget.hidden = true;
+    } catch (error) {
+      this.statusTarget.textContent =
+        error instanceof Error ? error.message : "Could not discard the upload.";
+    }
   }
   navigate(event: Event) {
     if (!location.pathname.startsWith("/share/")) return;
@@ -157,7 +200,7 @@ class ShareController extends Controller<HTMLElement> {
     this.statusTarget.textContent = "";
     if (!file) return;
     if (file.size > MAX_FILE_SIZE) {
-      this.statusTarget.textContent = "Please choose a file no larger than 24 MiB.";
+      this.statusTarget.textContent = "Please choose a file no larger than 5 GiB.";
       this.remove();
       return;
     }
@@ -169,6 +212,10 @@ class ShareController extends Controller<HTMLElement> {
     this.submitTarget.disabled = false;
   }
   remove() {
+    if (this.sending) {
+      this.sending.abort();
+      return;
+    }
     this.file = null;
     this.inputTarget.value = "";
     this.selectedTarget.hidden = true;
@@ -176,15 +223,19 @@ class ShareController extends Controller<HTMLElement> {
     this.submitTarget.disabled = true;
   }
   async send() {
-    if (!this.file) return;
+    if (!this.file || this.sending) return;
     const file = this.file;
     const expiry = this.expiryTarget.selectedOptions[0]!;
+    const controller = new AbortController();
     this.statusTarget.textContent = "";
+    this.resumeNoteTarget.hidden = true;
+    this.sending = controller;
     this.setSending(true);
     try {
-      this.linkTarget.value = await createShare(file, Number(expiry.value), (progress) =>
-        this.showProgress(progress),
-      );
+      this.linkTarget.value = await createShare(file, Number(expiry.value), {
+        signal: controller.signal,
+        onProgress: (progress) => this.showProgress(progress),
+      });
       this.resultNoteTarget.textContent = `Anyone with this link can decrypt your file. ${
         Number(expiry.value) === 0
           ? "It never expires."
@@ -193,26 +244,43 @@ class ShareController extends Controller<HTMLElement> {
       this.sendViewTarget.hidden = true;
       this.resultTarget.hidden = false;
     } catch (error) {
-      this.statusTarget.textContent =
-        error instanceof Error ? error.message : "Could not create your link. Please try again.";
+      this.statusTarget.textContent = controller.signal.aborted
+        ? "Upload cancelled."
+        : error instanceof Error
+          ? error.message
+          : "Could not create your link. Please try again.";
     } finally {
+      this.sending = null;
       this.setSending(false);
       this.fileSizeTarget.textContent = `${formatSize(file.size)} · Ready to encrypt`;
+      void this.showPending();
     }
   }
   // Locks the form while a file is in flight so the upload can't be changed or repeated.
+  // The remove button cancels the upload instead.
   setSending(sending: boolean) {
     this.submitTarget.disabled = sending;
     this.expiryTarget.disabled = sending;
-    this.removeButtonTarget.disabled = sending;
+    this.removeButtonTarget.setAttribute(
+      "aria-label",
+      sending ? "Cancel upload" : "Remove selected file",
+    );
     this.progressTarget.hidden = !sending;
     this.setProgress(0);
-    this.submitTextTarget.textContent = sending ? "Encrypting…" : "Create a private link";
+    this.submitTextTarget.textContent = sending ? "Preparing…" : "Create a private link";
+    if (sending) window.addEventListener("beforeunload", this.leaving);
+    else window.removeEventListener("beforeunload", this.leaving);
   }
   showProgress(progress: ShareProgress) {
-    if (progress.stage === "encrypting") {
-      this.fileSizeTarget.textContent = "Encrypting in your browser…";
-      this.submitTextTarget.textContent = "Encrypting…";
+    if (progress.stage === "preparing") {
+      this.fileSizeTarget.textContent = "Preparing your file…";
+      this.submitTextTarget.textContent = "Preparing…";
+    } else if (progress.stage === "reconnecting") {
+      const seconds = Math.max(1, Math.ceil((progress.retryAt - Date.now()) / 1000));
+      this.fileSizeTarget.textContent = progress.offline
+        ? "You are offline. The upload continues when you reconnect."
+        : `Connection problem. Retrying in ${seconds} s…`;
+      this.submitTextTarget.textContent = "Reconnecting…";
     } else if (progress.stage === "uploading") {
       const percent = Math.floor((progress.loaded / progress.total) * 100);
       this.setProgress(percent);
