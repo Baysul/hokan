@@ -29,9 +29,29 @@ jobs:
   build-and-test:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    # Runs for the same branch go one at a time, so `latest` always ends up on the newest commit.
+    concurrency:
+      group: docker-${{ github.ref }}
     steps:
       - uses: actions/checkout@v4
       - name: Build image
-        run: docker build --tag hokan:ci .
+        # The source label links the published package to this repository.
+        run: |
+          docker build --tag hokan:ci \
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" .
       - name: Test image
         run: bash scripts/test-docker.sh hokan:ci
+      - name: Publish image
+        if: github.ref == 'refs/heads/main'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          docker tag hokan:ci "$image:latest"
+          docker tag hokan:ci "$image:sha-${GITHUB_SHA::7}"
+          echo "$GITHUB_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker push --all-tags "$image"
