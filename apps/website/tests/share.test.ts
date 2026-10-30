@@ -53,14 +53,7 @@ class FakeServer {
     headers: Record<string, string>,
     body: Uint8Array | null,
   ): Reply {
-    if (method === "POST" && path === "/api/uploads") {
-      const length = Number(headers["x-hokan-upload-length"]);
-      const id = crypto.randomUUID();
-      const token = `${id}.${length}.${"ab".repeat(16)}`;
-      this.created.push({ length, expiry: headers["x-hokan-expiry-seconds"] });
-      this.uploads.set(token, { id, length, parts: new Map() });
-      return json(201, { upload: token, part_size: this.partSize });
-    }
+    if (method === "POST" && path === "/api/uploads") return this.create(headers);
     const [, token, action, number] =
       /^\/api\/uploads\/([^/]+)(?:\/(complete|parts)(?:\/(\d+))?)?$/.exec(path) ?? [];
     if (!token) return { status: 404 };
@@ -69,41 +62,62 @@ class FakeServer {
       this.uploads.delete(token);
       return { status: 204 };
     }
-    if (method === "POST" && action === "complete") {
-      const done = this.completed.get(token);
-      if (done) return json(201, { id: done, expires_in_seconds: 86400 });
-      if (!upload) return { status: 404, body: "Upload not found", type: "text/plain" };
-      const bytes = new Uint8Array(upload.length);
-      for (let part = 1; part <= Math.ceil(upload.length / this.partSize); part++) {
-        const received = upload.parts.get(part);
-        if (!received) return { status: 409, body: "Upload is missing parts", type: "text/plain" };
-        bytes.set(received, (part - 1) * this.partSize);
-      }
-      this.files.set(upload.id, bytes);
-      this.uploads.delete(token);
-      this.completed.set(token, upload.id);
-      return json(201, { id: upload.id, expires_in_seconds: 86400 });
-    }
+    if (method === "POST" && action === "complete") return this.complete(token, upload);
     if (!upload) return { status: 404, body: "Upload not found", type: "text/plain" };
-    if (method === "GET" && !action)
+    if (method === "GET" && !action) {
       return json(200, {
         part_size: this.partSize,
-        received: [...upload.parts.keys()].sort((a, b) => a - b),
+        received: [...upload.parts.keys()].toSorted((a, b) => a - b),
       });
+    }
     if (method === "PUT" && action === "parts") {
-      const part = Number(number);
-      const expected = Math.min(this.partSize, upload.length - (part - 1) * this.partSize);
-      if (headers["content-type"] !== "application/octet-stream" || body?.length !== expected)
-        return { status: 400, body: "Part has the wrong size", type: "text/plain" };
-      upload.parts.set(part, body.slice());
-      return { status: 204 };
+      return this.receivePart(upload, Number(number), headers, body);
     }
     return { status: 405 };
+  }
+
+  private create(headers: Record<string, string>): Reply {
+    const length = Number(headers["x-hokan-upload-length"]);
+    const id = crypto.randomUUID();
+    const token = `${id}.${length}.${"ab".repeat(16)}`;
+    this.created.push({ length, expiry: headers["x-hokan-expiry-seconds"] });
+    this.uploads.set(token, { id, length, parts: new Map() });
+    return json(201, { upload: token, part_size: this.partSize });
+  }
+
+  private complete(token: string, upload: Upload | undefined): Reply {
+    const done = this.completed.get(token);
+    if (done) return json(201, { id: done, expires_in_seconds: 86400 });
+    if (!upload) return { status: 404, body: "Upload not found", type: "text/plain" };
+    const bytes = new Uint8Array(upload.length);
+    for (let part = 1; part <= Math.ceil(upload.length / this.partSize); part++) {
+      const received = upload.parts.get(part);
+      if (!received) return { status: 409, body: "Upload is missing parts", type: "text/plain" };
+      bytes.set(received, (part - 1) * this.partSize);
+    }
+    this.files.set(upload.id, bytes);
+    this.uploads.delete(token);
+    this.completed.set(token, upload.id);
+    return json(201, { id: upload.id, expires_in_seconds: 86400 });
+  }
+
+  private receivePart(
+    upload: Upload,
+    part: number,
+    headers: Record<string, string>,
+    body: Uint8Array | null,
+  ): Reply {
+    const expected = Math.min(this.partSize, upload.length - (part - 1) * this.partSize);
+    if (headers["content-type"] !== "application/octet-stream" || body?.length !== expected) {
+      return { status: 400, body: "Part has the wrong size", type: "text/plain" };
+    }
+    upload.parts.set(part, body.slice());
+    return { status: 204 };
   }
 }
 
 function install(server: FakeServer) {
-  class FakeRequest {
+  class FakeRequest extends EventTarget {
     private method = "";
     private url = "";
     private headers: Record<string, string> = {};
@@ -112,11 +126,7 @@ function install(server: FakeServer) {
     private aborted = false;
     status = 0;
     responseText = "";
-    upload: { onprogress?: (event: { loaded: number }) => void; onload?: () => void } = {};
-    onload?: () => void;
-    onerror?: () => void;
-    ontimeout?: () => void;
-    onabort?: () => void;
+    upload = new EventTarget();
     open(method: string, url: string) {
       this.method = method;
       this.url = url;
@@ -131,22 +141,25 @@ function install(server: FakeServer) {
     abort() {
       if (this.aborted) return;
       this.aborted = true;
-      queueMicrotask(() => this.onabort?.());
+      queueMicrotask(() => this.dispatchEvent(new Event("abort")));
     }
     send(body: Uint8Array | null) {
       setTimeout(() => {
         if (this.aborted) return;
         const reply = server.handle(this.method, this.url, this.headers, body);
-        if (reply === "network-error") return this.onerror?.();
+        if (reply === "network-error") {
+          this.dispatchEvent(new Event("error"));
+          return;
+        }
         if (body) {
-          this.upload.onprogress?.({ loaded: body.length });
-          this.upload.onload?.();
+          this.upload.dispatchEvent(Object.assign(new Event("progress"), { loaded: body.length }));
+          this.upload.dispatchEvent(new Event("load"));
         }
         this.status = reply.status;
         this.responseText = reply.body ?? "";
         this.replyType = reply.type ?? null;
         this.retryAfter = reply.retryAfter ?? null;
-        this.onload?.();
+        this.dispatchEvent(new Event("load"));
       });
     }
   }
@@ -381,8 +394,7 @@ const rest = (envelope: Uint8Array<ArrayBuffer>, start: number, total = envelope
     headers: { "content-range": `bytes ${start}-${envelope.length - 1}/${total}` },
   });
 
-const rangeOf = (init?: RequestInit) =>
-  (init?.headers as Record<string, string> | undefined)?.Range ?? null;
+const rangeOf = (init?: RequestInit) => new Headers(init?.headers).get("Range");
 
 test("continues a download from where the connection failed", async () => {
   const contents = patterned(3 * 1024 * 1024);

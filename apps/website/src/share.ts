@@ -40,8 +40,9 @@ function decodeKey(value: string): Uint8Array<ArrayBuffer> {
   if (!/^[A-Za-z0-9_-]{43}$/.test(value)) throw new Error("This share link has an invalid key.");
   const decoded = atob(value.replaceAll("-", "+").replaceAll("_", "/") + "=");
   const bytes = Uint8Array.from(decoded, (character) => character.charCodeAt(0));
-  if (bytes.length !== KEY_LENGTH || encodeKey(bytes) !== value)
+  if (bytes.length !== KEY_LENGTH || encodeKey(bytes) !== value) {
     throw new Error("This share link has an invalid key.");
+  }
   return bytes;
 }
 
@@ -56,7 +57,7 @@ function chunkNonce(prefix: Uint8Array, index: number, last: boolean): Uint8Arra
 function safeName(name: string): string {
   return (
     Array.from(name, (character) => {
-      const code = character.codePointAt(0)!;
+      const code = character.codePointAt(0) ?? 0;
       // Direction controls can make an executable filename look like a document.
       const directionControl =
         code === 0x061c ||
@@ -89,8 +90,9 @@ function safeType(type: unknown): string {
 function readMetadata(plaintext: Uint8Array): { name: string; type: string; offset: number } {
   if (plaintext.byteLength < 4) throw new Error("This file's metadata is invalid.");
   const length = new DataView(plaintext.buffer, plaintext.byteOffset).getUint32(0);
-  if (length > MAX_METADATA_SIZE || 4 + length > plaintext.byteLength)
+  if (length > MAX_METADATA_SIZE || 4 + length > plaintext.byteLength) {
     throw new Error("This file's metadata is invalid.");
+  }
   let metadata: unknown;
   try {
     metadata = JSON.parse(
@@ -104,13 +106,30 @@ function readMetadata(plaintext: Uint8Array): { name: string; type: string; offs
     typeof metadata !== "object" ||
     !("name" in metadata) ||
     typeof metadata.name !== "string"
-  )
+  ) {
     throw new Error("This file's metadata is invalid.");
+  }
   return {
     name: safeName(metadata.name),
     type: safeType("type" in metadata ? metadata.type : undefined),
     offset: 4 + length,
   };
+}
+
+// Encodes the file's name and type, after checking that the file can be shared.
+function fileMetadata(file: File): Uint8Array<ArrayBuffer> {
+  if (file.size > MAX_FILE_SIZE) throw new Error("Choose a file no larger than 5 GiB.");
+  const metadata = new TextEncoder().encode(
+    JSON.stringify({ name: safeName(file.name), type: safeType(file.type) }),
+  );
+  if (metadata.length > MAX_METADATA_SIZE) throw new Error("The file name is too long.");
+  return metadata;
+}
+
+// Checks that this browser can encrypt and that the file can be shared.
+export function checkFile(file: File): void {
+  cryptoApi();
+  fileMetadata(file);
 }
 
 export type ShareSecrets = {
@@ -151,11 +170,7 @@ export class Envelope {
   private readonly chunks: number;
 
   constructor(file: File, secrets: ShareSecrets) {
-    if (file.size > MAX_FILE_SIZE) throw new Error("Choose a file no larger than 5 GiB.");
-    const metadata = new TextEncoder().encode(
-      JSON.stringify({ name: safeName(file.name), type: safeType(file.type) }),
-    );
-    if (metadata.length > MAX_METADATA_SIZE) throw new Error("The file name is too long.");
+    const metadata = fileMetadata(file);
     this.file = file;
     this.secrets = secrets;
     this.header = new Uint8Array(4 + metadata.length);
@@ -202,8 +217,9 @@ export class Envelope {
     const key = await crypto.subtle.importKey("raw", this.secrets.rawKey, "AES-GCM", false, [
       "encrypt",
     ]);
-    if (first === 0)
+    if (first === 0) {
       yield { offset: 0, bytes: Uint8Array.of(VERSION, ...this.secrets.noncePrefix) };
+    }
     for (let index = first; index < this.chunks; index++) {
       const start = index * CHUNK_SIZE;
       const end = Math.min(start + CHUNK_SIZE, this.plaintextSize);
@@ -242,8 +258,9 @@ const SPOOL_DIRECTORY = "hokan-spool";
 const SPOOL_MAX_AGE = 24 * 60 * 60 * 1000;
 
 function storageError(error: unknown): never {
-  if (error instanceof DOMException && error.name === "QuotaExceededError")
+  if (error instanceof DOMException && error.name === "QuotaExceededError") {
     throw new Error("Your browser does not have enough free storage space for this file.");
+  }
   throw error;
 }
 
@@ -257,9 +274,10 @@ async function openSpool(): Promise<Spool> {
     for await (const [name, entry] of directory.entries()) {
       if (
         entry.kind === "file" &&
-        Date.now() - (await (entry as FileSystemFileHandle).getFile()).lastModified > SPOOL_MAX_AGE
-      )
+        Date.now() - (await entry.getFile()).lastModified > SPOOL_MAX_AGE
+      ) {
         await directory.removeEntry(name).catch(() => undefined);
+      }
     }
     const name = crypto.randomUUID();
     const handle = await directory.getFileHandle(name, { create: true });
@@ -299,7 +317,9 @@ class ByteQueue {
     const bytes = new Uint8Array(count);
     let offset = 0;
     while (offset < count) {
-      const chunk = this.chunks[0]!;
+      const chunk = this.chunks[0];
+      // Callers check the queue's length first.
+      if (!chunk) throw new RangeError("Fewer bytes are queued than were taken.");
       const used = Math.min(chunk.byteLength, count - offset);
       bytes.set(chunk.subarray(0, used), offset);
       offset += used;
@@ -332,13 +352,14 @@ class Interrupted extends Error {
 // Reads the encrypted file. If the connection fails or stalls part way, it asks the server for
 // the rest with a Range request, so a large download continues instead of starting over. It
 // retries for as long as the page stays open, and right away when the browser comes back online.
+type Connection = { reader: ReadableStreamDefaultReader<Uint8Array>; controller: AbortController };
+
 class Download {
   received = 0;
   private total: number | null = null;
   private readonly url: string;
   private readonly onProgress?: (progress: DownloadProgress) => void;
-  private reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
-  private controller: AbortController | null = null;
+  private connection: Connection | null = null;
   // Bytes to drop from the next response, when a server sends the whole file again.
   private skip = 0;
   private failures = 0;
@@ -352,34 +373,18 @@ class Download {
   // Returns the next bytes, or null at the end of the file.
   async read(): Promise<Uint8Array | null> {
     for (;;) {
-      if (!this.reader) {
-        if (this.failures > 0) {
-          const delay = backoff(this.failures - 1, this.retryAfter);
-          this.onProgress?.({
-            stage: "reconnecting",
-            retryAt: Date.now() + delay,
-            offline: navigator.onLine === false,
-          });
-          await pause(delay);
-        }
-        try {
-          await this.connect();
-        } catch (error) {
-          if (!(error instanceof Interrupted)) throw error;
-          this.failed(error.retryAfter);
-          continue;
-        }
-      }
+      const connection = this.connection ?? (await this.reconnect());
+      if (!connection) continue;
       let result: ReadableStreamReadResult<Uint8Array>;
       try {
-        result = await this.guard(this.reader!.read(), this.controller!);
+        result = await this.guard(connection.reader.read(), connection.controller);
       } catch {
         this.drop();
         this.failed(null);
         continue;
       }
       if (result.done) {
-        this.reader = null;
+        this.connection = null;
         // A response that ends before the whole file has arrived is continued too.
         if (this.total !== null && this.received < this.total) {
           this.failed(null);
@@ -403,10 +408,31 @@ class Download {
   }
 
   async cancel() {
-    const reader = this.reader;
-    this.reader = null;
-    this.controller?.abort();
-    await reader?.cancel().catch(() => undefined);
+    const connection = this.connection;
+    this.connection = null;
+    connection?.controller.abort();
+    await connection?.reader.cancel().catch(() => undefined);
+  }
+
+  // Waits after a failure, then connects. Returns null when the attempt failed but can be
+  // retried.
+  private async reconnect(): Promise<Connection | null> {
+    if (this.failures > 0) {
+      const delay = backoff(this.failures - 1, this.retryAfter);
+      this.onProgress?.({
+        stage: "reconnecting",
+        retryAt: Date.now() + delay,
+        offline: navigator.onLine === false,
+      });
+      await pause(delay);
+    }
+    try {
+      return await this.connect();
+    } catch (error) {
+      if (!(error instanceof Interrupted)) throw error;
+      this.failed(error.retryAfter);
+      return null;
+    }
   }
 
   private failed(retryAfter: number | null) {
@@ -415,9 +441,9 @@ class Download {
   }
 
   private drop() {
-    this.controller?.abort();
-    void this.reader?.cancel().catch(() => undefined);
-    this.reader = null;
+    this.connection?.controller.abort();
+    void this.connection?.reader.cancel().catch(() => undefined);
+    this.connection = null;
   }
 
   // Gives up on a connection that makes no progress for too long, so that it can be resumed.
@@ -436,7 +462,7 @@ class Download {
     }
   }
 
-  private async connect() {
+  private async connect(): Promise<Connection> {
     const controller = new AbortController();
     const headers: Record<string, string> =
       this.received > 0 ? { Range: `bytes=${this.received}-` } : {};
@@ -449,32 +475,48 @@ class Download {
     } catch {
       throw new Interrupted();
     }
-    if (response.status === 404)
+    if (response.status === 404) {
       throw new Error("This file has expired or is no longer available.");
-    if (retryableStatus(response.status))
-      throw new Interrupted(parseRetryAfter(response.headers.get("retry-after")));
-    let total: number | null;
-    if (response.status === 206) {
-      const range = /^bytes (\d+)-\d+\/(\d+)$/.exec(response.headers.get("content-range") ?? "");
-      if (!range || Number(range[1]) !== this.received) throw new Error(INVALID_ENVELOPE);
-      total = Number(range[2]);
-      this.skip = 0;
-    } else if (response.status === 200) {
-      const length = response.headers.get("content-length");
-      total = length === null ? null : Number(length);
-      this.skip = this.received;
-    } else {
-      throw new Error("The encrypted file could not be retrieved.");
     }
+    if (retryableStatus(response.status)) {
+      throw new Interrupted(parseRetryAfter(response.headers.get("retry-after")));
+    }
+    const total = this.lineUp(response);
     // A different length would mean a different file.
-    if (this.total !== null && total !== null && total !== this.total)
+    if (this.total !== null && total !== null && total !== this.total) {
       throw new Error(INVALID_ENVELOPE);
+    }
     this.total ??= total;
     if (this.total !== null && this.total > MAX_ENVELOPE_SIZE) throw new Error(INVALID_ENVELOPE);
     if (!response.body) throw new Error(INVALID_ENVELOPE);
-    this.reader = response.body.getReader();
-    this.controller = controller;
+    this.connection = { reader: response.body.getReader(), controller };
+    return this.connection;
   }
+
+  // Lines a response up with the bytes received so far, and returns the envelope's size if the
+  // response gives it. A server that ignores the Range header sends the whole file again.
+  private lineUp(response: Response): number | null {
+    if (response.status === 206) {
+      const range = /^bytes (\d+)-\d+\/(\d+)$/.exec(response.headers.get("content-range") ?? "");
+      if (!range || Number(range[1]) !== this.received) throw new Error(INVALID_ENVELOPE);
+      this.skip = 0;
+      return Number(range[2]);
+    }
+    if (response.status === 200) {
+      const length = response.headers.get("content-length");
+      this.skip = this.received;
+      return length === null ? null : Number(length);
+    }
+    throw new Error("The encrypted file could not be retrieved.");
+  }
+}
+
+// Reads the file ID and key from the page's share link, or returns null on other pages.
+function linkedShare(): { id: string; rawKey: Uint8Array<ArrayBuffer> } | null {
+  if (!location.pathname.startsWith("/share/")) return null;
+  const id = location.pathname.slice("/share/".length);
+  if (!/^[0-9a-f-]{36}$/.test(id)) throw new Error("This share link is invalid.");
+  return { id, rawKey: decodeKey(location.hash.slice(1)) };
 }
 
 // The blob stays application/octet-stream: a blob URL runs in this origin, so a sender-chosen
@@ -482,12 +524,10 @@ class Download {
 export async function openShare(
   onProgress?: (progress: DownloadProgress) => void,
 ): Promise<{ blob: Blob; name: string; type: string } | null> {
-  if (!location.pathname.startsWith("/share/")) return null;
-  const id = location.pathname.slice("/share/".length);
-  if (!/^[0-9a-f-]{36}$/.test(id)) throw new Error("This share link is invalid.");
-  const rawKey = decodeKey(location.hash.slice(1));
+  const link = linkedShare();
+  if (!link) return null;
   const crypto = cryptoApi();
-  const key = await crypto.subtle.importKey("raw", rawKey, "AES-GCM", false, ["decrypt"]);
+  const key = await crypto.subtle.importKey("raw", link.rawKey, "AES-GCM", false, ["decrypt"]);
   const decrypt = async (iv: Uint8Array<ArrayBuffer>, sealed: Uint8Array<ArrayBuffer>) => {
     try {
       return new Uint8Array(await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, sealed));
@@ -496,7 +536,7 @@ export async function openShare(
     }
   };
 
-  const download = new Download(`/api/files/${id}`, onProgress);
+  const download = new Download(`/api/files/${link.id}`, onProgress);
   const queue = new ByteQueue();
   let limit = MAX_ENVELOPE_SIZE;
   let done = false;
@@ -526,8 +566,9 @@ export async function openShare(
       const { name, type, offset } = readMetadata(plaintext);
       return { name, type, blob: new Blob([plaintext.subarray(offset)], { type: DEFAULT_TYPE }) };
     }
-    if (version !== VERSION || queue.length < NONCE_PREFIX_LENGTH)
+    if (version !== VERSION || queue.length < NONCE_PREFIX_LENGTH) {
       throw new Error(INVALID_ENVELOPE);
+    }
     const noncePrefix = queue.take(NONCE_PREFIX_LENGTH);
     spool = await openSpool();
     let file: { name: string; type: string } | null = null;
@@ -545,7 +586,7 @@ export async function openShare(
       await spool.write(plaintext);
       if (last) break;
     }
-    return { ...file!, blob: new Blob([await spool.close()], { type: DEFAULT_TYPE }) };
+    return { ...file, blob: new Blob([await spool.close()], { type: DEFAULT_TYPE }) };
   } catch (error) {
     await download.cancel();
     await spool?.discard();

@@ -1,6 +1,7 @@
 import {
   Envelope,
   FileChangedError,
+  checkFile,
   newSecrets,
   shareLink,
   type ChunkCheck,
@@ -48,21 +49,24 @@ type Reply = { status: number; text: string; type: string | null; retryAfter: nu
 // The request got no answer: the connection failed, stalled or was cut off.
 class NetworkError extends Error {}
 
+function httpErrorMessage(reply: Reply): string {
+  if (reply.status === 405) {
+    return "The server does not support uploads. Restart it with the latest version.";
+  }
+  if (reply.status === 413) return "The file is larger than the server accepts.";
+  if (reply.status === 429) {
+    return "The server's daily upload limit has been reached. Try again later to continue this upload.";
+  }
+  // The server explains its own refusals in plain text; proxies and dev servers do not.
+  const reason = reply.type?.startsWith("text/plain") ? reply.text.trim().slice(0, 120) : "";
+  return `The server could not store the file (${reason || `error ${reply.status}`}).`;
+}
+
 class HttpError extends Error {
   readonly reply: Reply;
 
   constructor(reply: Reply) {
-    // The server explains its own refusals in plain text; proxies and dev servers do not.
-    const reason = reply.type?.startsWith("text/plain") ? reply.text.trim().slice(0, 120) : "";
-    super(
-      reply.status === 405
-        ? "The server does not support uploads. Restart it with the latest version."
-        : reply.status === 413
-          ? "The file is larger than the server accepts."
-          : reply.status === 429
-            ? "The server's daily upload limit has been reached. Try again later to continue this upload."
-            : `The server could not store the file (${reason || `error ${reply.status}`}).`,
-    );
+    super(httpErrorMessage(reply));
     this.reply = reply;
   }
 }
@@ -96,14 +100,15 @@ function send(
       options.signal.removeEventListener("abort", cancel);
     };
     request.open(method, url);
-    for (const [name, value] of Object.entries(options.headers ?? {}))
+    for (const [name, value] of Object.entries(options.headers ?? {})) {
       request.setRequestHeader(name, value);
-    request.upload.onprogress = (event) => {
+    }
+    request.upload.addEventListener("progress", (event) => {
       watch(timing.stall);
       options.onProgress?.(event.loaded);
-    };
-    request.upload.onload = () => watch(timing.response);
-    request.onload = () => {
+    });
+    request.upload.addEventListener("load", () => watch(timing.response));
+    request.addEventListener("load", () => {
       settle();
       resolve({
         status: request.status,
@@ -111,16 +116,16 @@ function send(
         type: request.getResponseHeader("Content-Type"),
         retryAfter: parseRetryAfter(request.getResponseHeader("Retry-After")),
       });
+    });
+    const fail = () => {
+      settle();
+      reject(
+        options.signal.aborted ? abortReason(options.signal) : new NetworkError(CONNECT_ERROR),
+      );
     };
-    request.onerror =
-      request.ontimeout =
-      request.onabort =
-        () => {
-          settle();
-          reject(
-            options.signal.aborted ? abortReason(options.signal) : new NetworkError(CONNECT_ERROR),
-          );
-        };
+    request.addEventListener("error", fail);
+    request.addEventListener("timeout", fail);
+    request.addEventListener("abort", fail);
     options.signal.addEventListener("abort", cancel);
     watch(options.body ? timing.stall : timing.response);
     request.send(options.body ?? null);
@@ -189,16 +194,17 @@ const CURRENT = "current";
 
 function result<T>(request: IDBRequest<T>): Promise<T> {
   return new Promise((resolve, reject) => {
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error);
+    request.addEventListener("success", () => resolve(request.result));
+    request.addEventListener("error", () => reject(request.error));
   });
 }
 
 function committed(transaction: IDBTransaction): Promise<void> {
   return new Promise((resolve, reject) => {
-    transaction.oncomplete = () => resolve();
-    transaction.onerror = transaction.onabort = () =>
-      reject(transaction.error ?? new Error("Browser storage failed."));
+    const fail = () => reject(transaction.error ?? new Error("Browser storage failed."));
+    transaction.addEventListener("complete", () => resolve());
+    transaction.addEventListener("error", fail);
+    transaction.addEventListener("abort", fail);
   });
 }
 
@@ -214,14 +220,36 @@ function openDatabase(): Promise<IDBDatabase | null> {
     } catch {
       return resolve(null);
     }
-    opening.onupgradeneeded = () => {
+    opening.addEventListener("upgradeneeded", () => {
       opening.result.createObjectStore(UPLOADS);
       opening.result.createObjectStore(DIGESTS);
-    };
-    opening.onsuccess = () => resolve(opening.result);
-    opening.onerror = opening.onblocked = () => resolve(null);
+    });
+    opening.addEventListener("success", () => resolve(opening.result));
+    opening.addEventListener("error", () => resolve(null));
+    opening.addEventListener("blocked", () => resolve(null));
   });
   return database;
+}
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null;
+
+// Saved uploads come from an earlier visit, so they are checked before they are used.
+function isSavedUpload(value: unknown): value is SavedUpload {
+  if (!isRecord(value)) return false;
+  const { file } = value;
+  return (
+    typeof value.token === "string" &&
+    typeof value.partSize === "number" &&
+    value.rawKey instanceof Uint8Array &&
+    value.noncePrefix instanceof Uint8Array &&
+    typeof value.expirySeconds === "number" &&
+    typeof value.started === "number" &&
+    isRecord(file) &&
+    typeof file.name === "string" &&
+    typeof file.size === "number" &&
+    typeof file.lastModified === "number"
+  );
 }
 
 async function loadSaved(): Promise<SavedUpload | null> {
@@ -229,7 +257,8 @@ async function loadSaved(): Promise<SavedUpload | null> {
     const db = await openDatabase();
     if (!db) return null;
     const store = db.transaction(UPLOADS, "readonly").objectStore(UPLOADS);
-    return ((await result(store.get(CURRENT))) as SavedUpload | undefined) ?? null;
+    const saved: unknown = await result(store.get(CURRENT));
+    return isSavedUpload(saved) ? saved : null;
   } catch {
     return null;
   }
@@ -244,7 +273,17 @@ async function loadDigests(token: string): Promise<Map<number, Uint8Array>> {
     result(store.getAllKeys(range)),
     result(store.getAll(range)),
   ]);
-  return new Map(keys.map((key, index) => [(key as [string, number])[1], values[index]]));
+  const digests = new Map<number, Uint8Array>();
+  for (const [position, key] of keys.entries()) {
+    const index = Array.isArray(key) ? key[1] : undefined;
+    const digest: unknown = values[position];
+    // Skipping a damaged digest would let a changed chunk be encrypted again with its nonce.
+    if (typeof index !== "number" || !(digest instanceof Uint8Array)) {
+      throw new Error("The saved upload is damaged.");
+    }
+    digests.set(index, digest);
+  }
+  return digests;
 }
 
 // Only one upload is kept, so saving one replaces whatever was saved before.
@@ -304,6 +343,14 @@ async function exclusively<T>(task: () => Promise<T>): Promise<T> {
 
 type Session = { token: string; partSize: number };
 
+type UploadState = {
+  envelope: Envelope;
+  session: Session;
+  secrets: ShareSecrets;
+  digests: Map<number, Uint8Array>;
+  persistent: boolean;
+};
+
 class Upload {
   readonly envelope: Envelope;
   readonly session: Session;
@@ -313,13 +360,7 @@ class Upload {
   private persistent: boolean;
   private saving: Promise<void> = Promise.resolve();
 
-  constructor(
-    envelope: Envelope,
-    session: Session,
-    secrets: ShareSecrets,
-    digests: Map<number, Uint8Array>,
-    persistent: boolean,
-  ) {
+  constructor({ envelope, session, secrets, digests, persistent }: UploadState) {
     this.envelope = envelope;
     this.session = session;
     this.secrets = secrets;
@@ -385,8 +426,9 @@ async function startSession(size: number, expirySeconds: number, ctx: Context): 
     typeof body.part_size !== "number" ||
     !Number.isSafeInteger(body.part_size) ||
     body.part_size < 1
-  )
+  ) {
     throw new Error("The server returned an invalid upload.");
+  }
   return { token: body.upload, partSize: body.part_size };
 }
 
@@ -409,10 +451,11 @@ async function receivedParts(session: Session, ctx: Context): Promise<Set<number
     typeof body !== "object" ||
     !("received" in body) ||
     !Array.isArray(body.received) ||
-    !body.received.every((number) => Number.isSafeInteger(number))
-  )
+    !body.received.every((value): value is number => Number.isSafeInteger(value))
+  ) {
     throw new Error("The server returned an invalid upload.");
-  return new Set(body.received as number[]);
+  }
+  return new Set(body.received);
 }
 
 // Returns the published file's ID, or why the upload could not be completed.
@@ -439,8 +482,9 @@ async function finish(
     !("id" in body) ||
     typeof body.id !== "string" ||
     !/^[0-9a-f-]{36}$/.test(body.id)
-  )
+  ) {
     throw new Error("The server returned an invalid share ID.");
+  }
   return { id: body.id };
 }
 
@@ -453,8 +497,9 @@ async function sendParts(upload: Upload, received: Set<number>, ctx: Context): P
   while (received.has(first)) first++;
   if (first > count) return;
   let sent = 0;
-  for (const number of received)
+  for (const number of received) {
     if (number >= 1 && number <= count) sent += Math.min(partSize, total - (number - 1) * partSize);
+  }
   const loading = new Map<number, number>();
   const waits = new Map<number, number>();
   const report = () => {
@@ -553,7 +598,7 @@ async function begin(file: File, expirySeconds: number, ctx: Context): Promise<U
     started: Date.now(),
     file: { name: file.name, size: file.size, lastModified: file.lastModified },
   });
-  return new Upload(envelope, session, secrets, new Map(), persistent);
+  return new Upload({ envelope, session, secrets, digests: new Map(), persistent });
 }
 
 // Picks up the saved upload if it is for this file, and discards it otherwise.
@@ -579,7 +624,8 @@ async function resume(file: File, expirySeconds: number): Promise<Upload | null>
   }
   const secrets = { rawKey: saved.rawKey, noncePrefix: saved.noncePrefix };
   const session = { token: saved.token, partSize: saved.partSize };
-  return new Upload(new Envelope(file, secrets), session, secrets, digests, true);
+  const envelope = new Envelope(file, secrets);
+  return new Upload({ envelope, session, secrets, digests, persistent: true });
 }
 
 // Encrypts and uploads a file, and returns its share link. An expirySeconds of 0 means the link
@@ -595,12 +641,13 @@ export async function createShare(
     signal,
     report,
     onWait: (retryAt) => {
-      if (retryAt !== null)
+      if (retryAt !== null) {
         report({ stage: "reconnecting", retryAt, offline: navigator.onLine === false });
+      }
     },
   };
   // Checks the file before anything is sent.
-  new Envelope(file, newSecrets());
+  checkFile(file);
   report({ stage: "preparing" });
   return exclusively(async () => {
     let upload = await resume(file, expirySeconds);
@@ -619,8 +666,11 @@ export async function createShare(
         // An upload refused only for today can be continued later.
         const later = error instanceof HttpError && error.reply.status === 429;
         if (upload && !later) await abandon(upload.session.token);
-        if (error instanceof SessionLost)
-          throw new Error("The server keeps losing this upload. Try again later.");
+        if (error instanceof SessionLost) {
+          throw new Error("The server keeps losing this upload. Try again later.", {
+            cause: error,
+          });
+        }
         throw error;
       }
     }
