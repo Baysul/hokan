@@ -35,15 +35,16 @@ const random = (() => {
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 })();
-const pick = (colors: readonly string[]) => colors[Math.floor(random() * colors.length)]!;
+const pick = (colors: readonly [string, ...string[]]) =>
+  colors[Math.floor(random() * colors.length)] ?? colors[0];
 const gaussian = () => (random() + random() + random() + random() - 2) * 1.73;
 const polar = (angle: number, radius: number): readonly [number, number] => [
   Math.cos(angle) * radius,
   Math.sin(angle) * radius,
 ];
 const delay = (span: number) => ` style="animation-delay:-${(random() * span).toFixed(2)}s"`;
-const blues = ["#173b88", "#2456ae", "#3567bd", "#4c82cc", "#698bc9", "#438ce0"];
-const lights = ["#b8dbef", "#e4ecf7", "#c6c8ed", "#f4d9df", "#fce6b7"];
+const blues = ["#173b88", "#2456ae", "#3567bd", "#4c82cc", "#698bc9", "#438ce0"] as const;
+const lights = ["#b8dbef", "#e4ecf7", "#c6c8ed", "#f4d9df", "#fce6b7"] as const;
 
 // The varying arm widths and scattered marks make the edges feel like stardust, while
 // the blue, blush and warm ivory echo the courier's suit, ears and gold details.

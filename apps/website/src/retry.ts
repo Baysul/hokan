@@ -45,7 +45,9 @@ export function pause(ms: number, signal?: AbortSignal): Promise<void> {
       else reject(error);
     };
     const wake = () => end();
-    const stop = () => end(abortReason(signal!));
+    const stop = () => {
+      if (signal) end(abortReason(signal));
+    };
     const timer = setTimeout(wake, ms);
     globalThis.addEventListener?.("online", wake);
     signal?.addEventListener("abort", stop);

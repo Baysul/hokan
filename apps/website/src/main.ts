@@ -19,7 +19,9 @@ const paths: Record<string, string> = {
 const icon = (name: string, size = 20) =>
   `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths[name]}</svg>`;
 
-document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
+const app = document.querySelector<HTMLDivElement>("#app");
+if (!app) throw new Error("The page is missing its #app element.");
+app.innerHTML = `
 <div class="app-shell" data-controller="share">
   <div class="sky" aria-hidden="true"><span class="shooting-star shooting-one"></span><span class="shooting-star shooting-two"></span></div>
   <main>
@@ -51,12 +53,11 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
   </main>
 </div>`;
 
-const formatSize = (bytes: number) =>
-  bytes < 1024 * 1024
-    ? `${(bytes / 1024).toFixed(1)} KiB`
-    : bytes < 1024 * 1024 * 1024
-      ? `${(bytes / 1024 / 1024).toFixed(1)} MiB`
-      : `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GiB`;
+const formatSize = (bytes: number) => {
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MiB`;
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GiB`;
+};
 class ShareController extends Controller<HTMLElement> {
   static targets = [
     "input",
@@ -114,10 +115,14 @@ class ShareController extends Controller<HTMLElement> {
   // the file again.
   private readonly leaving = (event: BeforeUnloadEvent) => event.preventDefault();
 
-  async connect() {
+  // Stimulus ignores what connect returns, so the async work is started without waiting.
+  connect() {
     this.active = true;
     window.addEventListener("hashchange", this.hashChanged);
-    if (!location.pathname.startsWith("/share/")) return this.showPending();
+    if (location.pathname.startsWith("/share/")) void this.receive();
+    else void this.showPending();
+  }
+  private async receive() {
     this.sendViewTarget.hidden = true;
     this.receiveTarget.hidden = false;
     try {
@@ -173,8 +178,8 @@ class ShareController extends Controller<HTMLElement> {
     }
   }
   navigate(event: Event) {
-    if (!location.pathname.startsWith("/share/")) return;
-    const link = event.currentTarget as HTMLAnchorElement;
+    const link = event.currentTarget;
+    if (!location.pathname.startsWith("/share/") || !(link instanceof HTMLAnchorElement)) return;
     const target = document.getElementById(link.hash.slice(1));
     if (target) {
       event.preventDefault();
@@ -223,9 +228,9 @@ class ShareController extends Controller<HTMLElement> {
     this.submitTarget.disabled = true;
   }
   async send() {
-    if (!this.file || this.sending) return;
+    const expiry = this.expiryTarget.selectedOptions[0];
+    if (!this.file || this.sending || !expiry) return;
     const file = this.file;
-    const expiry = this.expiryTarget.selectedOptions[0]!;
     const controller = new AbortController();
     this.statusTarget.textContent = "";
     this.resumeNoteTarget.hidden = true;
@@ -244,11 +249,9 @@ class ShareController extends Controller<HTMLElement> {
       this.sendViewTarget.hidden = true;
       this.resultTarget.hidden = false;
     } catch (error) {
-      this.statusTarget.textContent = controller.signal.aborted
-        ? "Upload cancelled."
-        : error instanceof Error
-          ? error.message
-          : "Could not create your link. Please try again.";
+      const message =
+        error instanceof Error ? error.message : "Could not create your link. Please try again.";
+      this.statusTarget.textContent = controller.signal.aborted ? "Upload cancelled." : message;
     } finally {
       this.sending = null;
       this.setSending(false);
