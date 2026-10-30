@@ -2,7 +2,6 @@ import { expect, test, type Browser, type Page } from "@playwright/test";
 import { createHash } from "node:crypto";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer, request as forward } from "node:http";
-import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -42,7 +41,7 @@ async function downloadHash(browser: Browser, link: string, name: string) {
     await expect(page.getByText(`Ready to download: ${name}`)).toBeVisible({ timeout: 60_000 });
     const download = page.waitForEvent("download");
     await page.getByRole("link", { name: "Download your file" }).click();
-    const contents = await readFile((await (await download).path())!);
+    const contents = await readFile(await (await download).path());
     return createHash("sha256").update(contents).digest("hex");
   } finally {
     await recipient.close();
@@ -66,9 +65,15 @@ async function cuttingProxy(target: URL, cut: number) {
       },
       (response) => {
         outgoing.writeHead(response.statusCode!, response.headers);
-        if (!incoming.url!.startsWith("/api/files/")) return response.pipe(outgoing);
+        if (!incoming.url!.startsWith("/api/files/")) {
+          response.pipe(outgoing);
+          return;
+        }
         ranges.push(incoming.headers.range);
-        if (ranges.length > 1) return response.pipe(outgoing);
+        if (ranges.length > 1) {
+          response.pipe(outgoing);
+          return;
+        }
         let sent = 0;
         response.on("data", (chunk: Buffer) => {
           if (sent >= cut) return;
@@ -85,9 +90,10 @@ async function cuttingProxy(target: URL, cut: number) {
     incoming.pipe(upstream);
   });
   await new Promise<void>((resolve) => proxy.listen(0, "127.0.0.1", resolve));
-  const { port } = proxy.address() as AddressInfo;
+  const address = proxy.address();
+  if (!address || typeof address === "string") throw new Error("The proxy has no port.");
   return {
-    origin: `http://127.0.0.1:${port}`,
+    origin: `http://127.0.0.1:${address.port}`,
     ranges,
     close() {
       proxy.closeAllConnections();
@@ -123,8 +129,9 @@ test("keeps uploading through dropped connections and server errors", async ({ b
     const attempt = (attempts.get(part) ?? 0) + 1;
     attempts.set(part, attempt);
     if (part === 2 && attempt === 1) return route.abort("connectionreset");
-    if (part === 3 && attempt === 1)
+    if (part === 3 && attempt === 1) {
       return route.fulfill({ status: 503, headers: { "Retry-After": "1" }, body: "Busy" });
+    }
     return route.continue();
   });
   await page.goto("/");
@@ -164,12 +171,12 @@ test("resumes after the page is reloaded without sending finished parts again", 
   const file = await makeFile("resume.bin");
   const sent = new Map<number, number>();
   let hold = true;
-  await page.route("**/api/uploads/*/parts/*", (route) => {
+  await page.route("**/api/uploads/*/parts/*", async (route) => {
     const part = partOf(route.request().url());
     // Leave the later parts hanging, as on a connection that drops before the page closes.
     if (hold && part !== 1) return;
     sent.set(part, (sent.get(part) ?? 0) + 1);
-    return route.continue();
+    await route.continue();
   });
   let sessions = 0;
   page.on("request", (request) => {

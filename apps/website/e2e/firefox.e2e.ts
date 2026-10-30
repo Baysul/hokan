@@ -6,8 +6,9 @@ test("encrypts a file, shares a link and downloads it in Firefox", async ({ brow
   const parts: Buffer[] = [];
   let expiry: string | undefined;
   page.on("request", (request) => {
-    if (request.method() === "POST" && request.url().endsWith("/api/uploads"))
+    if (request.method() === "POST" && request.url().endsWith("/api/uploads")) {
       expiry = request.headers()["x-hokan-expiry-seconds"];
+    }
     const body = request.method() === "PUT" && request.postDataBuffer();
     if (body) parts.push(body);
   });
@@ -40,7 +41,7 @@ test("encrypts a file, shares a link and downloads it in Firefox", async ({ brow
     await recipientPage.getByRole("link", { name: "Download your file" }).click();
     const download = await downloadPromise;
     expect(download.suggestedFilename()).toBe("secret.txt");
-    expect(await readFile((await download.path())!)).toEqual(contents);
+    expect(await readFile(await download.path())).toEqual(contents);
     const [url, key] = shareLink.split("#");
     const changedKey = `${key![0] === "A" ? "B" : "A"}${key!.slice(1)}`;
     await recipientPage.goto(`${url}#${changedKey}`);
@@ -55,8 +56,9 @@ test("encrypts a file, shares a link and downloads it in Firefox", async ({ brow
 test("creates a link that never expires and says so", async ({ page }) => {
   let expiry: string | undefined;
   page.on("request", (request) => {
-    if (request.method() === "POST" && request.url().endsWith("/api/uploads"))
+    if (request.method() === "POST" && request.url().endsWith("/api/uploads")) {
       expiry = request.headers()["x-hokan-expiry-seconds"];
+    }
   });
   await page.goto("/");
   await page
