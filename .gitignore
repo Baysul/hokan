@@ -27,6 +27,7 @@ __pycache__/
 !.vscode/settings.json
 !.vscode/extensions.json
 .idea
+.zed/
 .DS_Store
 *.suo
 *.ntvs*
@@ -36,3 +37,4 @@ __pycache__/
 
 # AI agent worktrees
 .claude/worktrees/
+AGENTS.md
