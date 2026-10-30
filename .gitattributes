@@ -1,0 +1,2 @@
+# The formatter requires LF, so checkouts use LF on every platform, whatever core.autocrlf says.
+* text=auto eol=lf
