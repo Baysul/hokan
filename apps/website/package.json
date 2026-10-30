@@ -7,8 +7,7 @@
     "dev": "vp dev",
     "build": "tsc && vp build",
     "preview": "vp preview",
-    "test": "vp test",
-    "test:e2e": "vp run build && playwright test -c playwright.config.ts"
+    "test": "vp test"
   },
   "dependencies": {
     "@fontsource-variable/fredoka": "catalog:",
