@@ -47,6 +47,8 @@ const STORAGE_TIMEOUT: Duration = Duration::from_secs(60);
 const PART_STORAGE_TIMEOUT: Duration = Duration::from_mins(5);
 const DEFAULT_LIFETIME: Duration = Duration::from_hours(24);
 const MIN_LIFETIME: Duration = Duration::from_hours(1);
+// A file is deleted once it goes this long without a download, even if its link never expires.
+const IDLE_LIFETIME: Duration = Duration::from_hours(7 * 24);
 const EXPIRY_HEADER: &str = "x-hokan-expiry-seconds";
 const LENGTH_HEADER: &str = "x-hokan-upload-length";
 const ALLOWED_EXPIRY_SECONDS: [u64; 3] = [3_600, 86_400, 604_800];
@@ -137,6 +139,8 @@ struct StoredFile {
     size: u64,
     lifetime: Option<Duration>,
     expires_at: Option<Instant>,
+    // When the file was last downloaded, or published if it has not been downloaded yet.
+    last_download: Instant,
 }
 
 struct MemoryUpload {
@@ -161,7 +165,8 @@ impl MemoryStore {
         let now = Instant::now();
         let mut freed = 0;
         self.files.retain(|_, file| {
-            let keep = file.expires_at.is_none_or(|expires| expires > now);
+            let keep = file.expires_at.is_none_or(|expires| expires > now)
+                && now.duration_since(file.last_download) < IDLE_LIFETIME;
             if !keep {
                 freed += file.size;
             }
@@ -257,6 +262,7 @@ impl MemoryStore {
                 size: upload.length,
                 lifetime: upload.lifetime,
                 expires_at: upload.lifetime.map(|lifetime| Instant::now() + lifetime),
+                last_download: Instant::now(),
             },
         );
         Ok(upload.lifetime)
@@ -787,6 +793,13 @@ async fn cloud_download(
     let Some(file) = opened else {
         return Ok(None);
     };
+    // The download goes ahead even if it cannot be recorded.
+    if let Err(error) = tokio::time::timeout(STORAGE_TIMEOUT, Box::pin(store.touch(id)))
+        .await
+        .unwrap_or_else(|_| Err("Cloud storage timed out".into()))
+    {
+        eprintln!("Could not record a download: {error}");
+    }
     let span = Span::new(range, file.size);
     if let Span::Unsatisfiable = span {
         return Ok(Some((file.size, span, Body::empty())));
@@ -815,9 +828,10 @@ async fn download(
         Store::Memory(store) => {
             let mut store = store.lock().expect("file store lock poisoned");
             store.remove_expired();
-            let Some(file) = store.files.get(&id) else {
+            let Some(file) = store.files.get_mut(&id) else {
                 return refuse(StatusCode::NOT_FOUND);
             };
+            file.last_download = Instant::now();
             let span = Span::new(range, file.size);
             let (start, end) = span.bounds(file.size);
             let parts = slice_parts(&file.parts, start, end)
@@ -983,7 +997,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         .remove_expired();
                 }
                 Store::Cloud(store) => {
-                    if let Err(error) = store.cleanup(MIN_LIFETIME, UPLOAD_SESSION_LIFETIME).await {
+                    if let Err(error) = store
+                        .cleanup(MIN_LIFETIME, IDLE_LIFETIME, UPLOAD_SESSION_LIFETIME)
+                        .await
+                    {
                         eprintln!("Cloud cleanup failed: {error}");
                     }
                 }
@@ -1275,6 +1292,34 @@ mod tests {
         let (status, _, body) = send(&app, download(&id)).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "abc");
+    }
+
+    #[tokio::test]
+    async fn files_are_deleted_after_a_week_without_downloads() {
+        let store = MemoryStore::shared(DEFAULT_MEMORY_LIMIT);
+        let app = api(Arc::clone(&store), small_parts());
+        let kept = upload(&app, b"kept", Some("0")).await;
+        let idle = upload(&app, b"idle", Some("0")).await;
+        let set_last_download = |id: &str, age: Duration| {
+            store
+                .lock()
+                .unwrap()
+                .files
+                .get_mut(&Uuid::parse_str(id).unwrap())
+                .unwrap()
+                .last_download = Instant::now().checked_sub(age).unwrap();
+        };
+        set_last_download(&kept, IDLE_LIFETIME.saturating_sub(Duration::from_hours(1)));
+        set_last_download(&idle, IDLE_LIFETIME);
+        let (status, _, _) = send(&app, download(&kept)).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _, _) = send(&app, download(&idle)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        // Downloading the kept file gave it another week.
+        let store = store.lock().unwrap();
+        let file = &store.files[&Uuid::parse_str(&kept).unwrap()];
+        assert!(file.last_download.elapsed() < Duration::from_mins(1));
+        assert_eq!(store.used, 4);
     }
 
     #[tokio::test]

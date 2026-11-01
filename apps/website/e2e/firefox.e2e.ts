@@ -53,7 +53,7 @@ test("encrypts a file, shares a link and downloads it in Firefox", async ({ brow
   }
 });
 
-test("creates a link that never expires and says so", async ({ page }) => {
+test("creates a link that lasts while it is used and says so", async ({ page }) => {
   let expiry: string | undefined;
   page.on("request", (request) => {
     if (request.method() === "POST" && request.url().endsWith("/api/uploads")) {
@@ -64,10 +64,10 @@ test("creates a link that never expires and says so", async ({ page }) => {
   await page
     .locator("#file-input")
     .setInputFiles({ name: "keep.txt", mimeType: "text/plain", buffer: Buffer.from("keep me") });
-  await page.getByLabel("Link expires").selectOption({ label: "Never" });
+  await page.getByLabel("Link expires").selectOption({ label: "When unused for 7 days" });
   await page.getByRole("button", { name: "Create a private link" }).click();
   await expect(page.getByLabel("Private share link")).toBeVisible();
-  await expect(page.getByText("It never expires.")).toBeVisible();
+  await expect(page.getByText("It expires once it goes 7 days without a download.")).toBeVisible();
   expect(expiry).toBe("0");
 });
 

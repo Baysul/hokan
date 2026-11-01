@@ -1,6 +1,6 @@
 # Hokan
 
-Hokan shares files with a link. Your browser encrypts each file, up to 5 GiB, before it is uploaded, and the decryption key stays in the link. Anyone with the full link can open the file, so keep links private. Links expire after 1 hour, 1 day, 7 days, or never.
+Hokan shares files with a link. Your browser encrypts each file, up to 5 GiB, before it is uploaded, and the decryption key stays in the link. Anyone with the full link can open the file, so keep links private. Links expire after 1 hour, 1 day, or 7 days, and any file that goes 7 days without a download is deleted.
 
 Uploads survive interruptions. If the connection drops or the server restarts, the browser keeps retrying and continues where it stopped. If the tab closes, choose the same file again within 24 hours to resume. Downloads that are cut off continue from where they stopped, too.
 

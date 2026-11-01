@@ -629,7 +629,7 @@ async function resume(file: File, expirySeconds: number): Promise<Upload | null>
 }
 
 // Encrypts and uploads a file, and returns its share link. An expirySeconds of 0 means the link
-// never expires.
+// expires only once the file goes 7 days without a download.
 export async function createShare(
   file: File,
   expirySeconds: number,

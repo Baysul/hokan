@@ -21,9 +21,12 @@ use uuid::Uuid;
 
 // A published file has a marker at hokan/{id}. The marker is written when the upload completes,
 // so the link's lifetime starts then. Its ciphertext is uploaded in parts to hokan/data/{id}.
-// Files from before resumable uploads keep their ciphertext in the marker itself.
+// Files from before resumable uploads keep their ciphertext in the marker itself. An empty object
+// at hokan/accessed/{id} was last modified when the file was last downloaded, or when cleanup
+// first found it.
 const PREFIX: &str = "hokan/";
 const DATA_PREFIX: &str = "hokan/data/";
+const ACCESSED_PREFIX: &str = "hokan/accessed/";
 const EXPIRES_METADATA: &str = "expires-at";
 const LIFETIME_METADATA: &str = "lifetime";
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
@@ -62,6 +65,10 @@ fn marker_key(id: Uuid) -> String {
 
 fn data_key(id: Uuid) -> String {
     format!("{DATA_PREFIX}{id}")
+}
+
+fn accessed_key(id: Uuid) -> String {
+    format!("{ACCESSED_PREFIX}{id}")
 }
 
 fn is_not_found<E>(error: &SdkError<E, HttpResponse>) -> bool {
@@ -428,6 +435,19 @@ impl CloudStore {
         }
     }
 
+    // Restarts the time until a file is deleted for going without downloads.
+    pub async fn touch(&self, id: Uuid) -> Result<(), StorageError> {
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(accessed_key(id))
+            .content_type("application/octet-stream")
+            .body(ByteStream::from_static(b""))
+            .send()
+            .await?;
+        Ok(())
+    }
+
     async fn list(
         &self,
         prefix: &str,
@@ -467,11 +487,19 @@ impl CloudStore {
         Ok(())
     }
 
+    // The ciphertext goes first, so the marker remains to find it if this fails.
+    async fn remove(&self, id: Uuid) -> Result<(), StorageError> {
+        self.delete(&data_key(id)).await?;
+        self.delete(&marker_key(id)).await?;
+        self.delete(&accessed_key(id)).await
+    }
+
     // Only touches objects in Hokan's namespace with a UUID name. S3 listings include each
     // object's last modification time, so cleanup still works after a server restart.
     pub async fn cleanup(
         &self,
         min_lifetime: Duration,
+        idle_lifetime: Duration,
         upload_lifetime: Duration,
     ) -> Result<(), StorageError> {
         let now = now_seconds()?;
@@ -481,6 +509,16 @@ impl CloudStore {
                     .is_ok_and(|secs| secs <= now.saturating_sub(age.as_secs()))
             })
         };
+        let mut accessed = HashMap::new();
+        for object in self.list(ACCESSED_PREFIX, None).await? {
+            if let Some(id) = object
+                .key()
+                .and_then(|key| key.strip_prefix(ACCESSED_PREFIX))
+                .and_then(|s| Uuid::parse_str(s).ok())
+            {
+                accessed.insert(id, object.last_modified().copied());
+            }
+        }
         let mut published = HashSet::new();
         for object in self.list(PREFIX, Some("/")).await? {
             let Some(key) = object.key() else { continue };
@@ -491,6 +529,15 @@ impl CloudStore {
                 continue;
             };
             published.insert(id);
+            match accessed.get(&id) {
+                // A new file, or one from before downloads were recorded, starts its idle time now.
+                None => self.touch(id).await?,
+                Some(time) if older_than(time.as_ref(), idle_lifetime) => {
+                    self.remove(id).await?;
+                    continue;
+                }
+                Some(_) => {}
+            }
             if !older_than(object.last_modified(), min_lifetime) {
                 continue;
             }
@@ -505,10 +552,12 @@ impl CloudStore {
                 head.metadata()
                     .and_then(|metadata| metadata.get(EXPIRES_METADATA)),
             )? {
-                // The ciphertext goes first, so the marker remains to find it if this fails.
-                self.delete(&data_key(id)).await?;
-                self.delete(key).await?;
+                self.remove(id).await?;
             }
+        }
+        // Download records of files that were removed.
+        for id in accessed.keys().filter(|id| !published.contains(id)) {
+            self.delete(&accessed_key(*id)).await?;
         }
         // Ciphertext from an upload that completed but whose marker was never written.
         for object in self.list(DATA_PREFIX, None).await? {
@@ -579,6 +628,7 @@ mod tests {
     struct Object {
         bytes: Bytes,
         metadata: Vec<(String, String)>,
+        modified: SystemTime,
     }
 
     struct Upload {
@@ -620,10 +670,10 @@ mod tests {
         let delimiter = query_value(query, "delimiter").map(decode);
         let skip: usize =
             query_value(query, "continuation-token").map_or(0, |t| t.parse().unwrap());
-        let keys: Vec<&String> = bucket
+        let objects: Vec<(&String, &Object)> = bucket
             .objects
-            .keys()
-            .filter(|key| {
+            .iter()
+            .filter(|(key, _)| {
                 key.strip_prefix(&prefix).is_some_and(|rest| {
                     delimiter
                         .as_deref()
@@ -631,12 +681,15 @@ mod tests {
                 })
             })
             .collect();
-        let more = keys.len() > skip + 1;
+        let more = objects.len() > skip + 1;
         let mut body = format!("<ListBucketResult><IsTruncated>{more}</IsTruncated>");
-        if let Some(key) = keys.get(skip) {
+        if let Some((key, object)) = objects.get(skip) {
+            let modified = aws_sdk_s3::primitives::DateTime::from(object.modified)
+                .fmt(aws_sdk_s3::primitives::DateTimeFormat::DateTime)
+                .unwrap();
             let _ = write!(
                 body,
-                "<Contents><Key>{key}</Key><LastModified>2000-01-01T00:00:00.000Z</LastModified><Size>1</Size></Contents>"
+                "<Contents><Key>{key}</Key><LastModified>{modified}</LastModified><Size>1</Size></Contents>"
             );
         }
         if more {
@@ -750,6 +803,7 @@ mod tests {
                     Object {
                         bytes: bytes.into(),
                         metadata: upload.metadata,
+                        modified: SystemTime::now(),
                     },
                 );
                 reply(
@@ -769,6 +823,7 @@ mod tests {
                     Object {
                         bytes: body,
                         metadata,
+                        modified: SystemTime::now(),
                     },
                 );
                 reply(200, "")
@@ -841,6 +896,26 @@ mod tests {
         let file = store.open(id, 100).await.unwrap()?;
         let body = store.read(&file, 0, file.size - 1).await.unwrap()?;
         Some(body.collect().await.unwrap().to_bytes())
+    }
+
+    // Makes the objects whose keys start with `prefix` look as if they were written long ago.
+    fn backdate(bucket: &Shared, prefix: &str) {
+        for (key, object) in &mut bucket.lock().unwrap().objects {
+            if key.starts_with(prefix) {
+                object.modified = UNIX_EPOCH;
+            }
+        }
+    }
+
+    async fn cleanup(store: &CloudStore) {
+        store
+            .cleanup(
+                Duration::from_hours(1),
+                Duration::from_hours(7 * 24),
+                Duration::from_hours(24),
+            )
+            .await
+            .unwrap();
     }
 
     fn cloud_api(store: &CloudStore) -> Router {
@@ -937,6 +1012,7 @@ mod tests {
         let object = |bytes: &'static [u8], expires: &str| Object {
             bytes: Bytes::from_static(bytes),
             metadata: vec![(EXPIRES_METADATA.to_owned(), expires.to_owned())],
+            modified: SystemTime::now(),
         };
         let (legacy, old_legacy) = (Uuid::new_v4(), Uuid::new_v4());
         bucket.lock().unwrap().objects.extend([
@@ -968,6 +1044,7 @@ mod tests {
             .unwrap();
         let abandoned = start(&app, 8, None).await;
         send(&app, part(&abandoned, 1, b"abcd")).await;
+        backdate(&bucket, "");
 
         assert_eq!(read(&store, legacy).await.unwrap(), "legacy");
         assert!(read(&store, old_legacy).await.is_none());
@@ -979,15 +1056,18 @@ mod tests {
         let body = store.read(&file, 2, 5).await.unwrap().unwrap();
         assert_eq!(body.collect().await.unwrap().to_bytes(), "ve d");
 
-        store
-            .cleanup(Duration::from_hours(1), Duration::from_hours(24))
-            .await
-            .unwrap();
+        cleanup(&store).await;
         {
             let bucket = bucket.lock().unwrap();
             let mut keys: Vec<&String> = bucket.objects.keys().collect();
             keys.sort();
-            let mut expected = [marker_key(legacy), marker_key(live), data_key(live)];
+            let mut expected = [
+                marker_key(legacy),
+                accessed_key(legacy),
+                marker_key(live),
+                data_key(live),
+                accessed_key(live),
+            ];
             expected.sort();
             assert_eq!(keys, expected.iter().collect::<Vec<_>>());
             assert!(bucket.uploads.is_empty());
@@ -997,6 +1077,55 @@ mod tests {
         let error_store = client(&endpoint, "error");
         assert!(error_store.open(live, 100).await.is_err());
         assert!(error_store.create_upload(live, None).await.is_err());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn cloud_deletes_files_that_go_a_week_without_downloads() {
+        let (endpoint, bucket, task) = start_mock().await;
+        let store = client(&endpoint, "test-bucket");
+        let app = cloud_api(&store);
+        let mut ids = Vec::new();
+        for data in [&b"kept"[..], b"idle", b"untracked"] {
+            ids.push(Uuid::parse_str(&upload(&app, data, Some("0")).await).unwrap());
+        }
+        let [kept, idle, untracked] = ids[..] else {
+            unreachable!()
+        };
+        for id in [kept, idle] {
+            let (status, _, _) = send(&app, download(&id.to_string())).await;
+            assert_eq!(status, StatusCode::OK);
+        }
+        // Every file was uploaded long ago, but only `kept` has been downloaded recently.
+        backdate(&bucket, PREFIX);
+        bucket
+            .lock()
+            .unwrap()
+            .objects
+            .get_mut(&accessed_key(kept))
+            .unwrap()
+            .modified = SystemTime::now();
+        // A file that went unrecorded gets a week from now, which also covers files uploaded
+        // before downloads were recorded.
+        bucket
+            .lock()
+            .unwrap()
+            .objects
+            .remove(&accessed_key(untracked));
+        let orphan = Uuid::new_v4();
+        store.touch(orphan).await.unwrap();
+
+        cleanup(&store).await;
+        let bucket = bucket.lock().unwrap();
+        let mut keys: Vec<&String> = bucket.objects.keys().collect();
+        keys.sort();
+        let mut expected = [kept, untracked]
+            .into_iter()
+            .flat_map(|id| [marker_key(id), data_key(id), accessed_key(id)])
+            .collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(keys, expected.iter().collect::<Vec<_>>());
+        assert!(bucket.objects[&accessed_key(untracked)].modified > UNIX_EPOCH);
         task.abort();
     }
 }

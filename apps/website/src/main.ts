@@ -41,7 +41,7 @@ app.innerHTML = `
             <input id="file-input" class="sr-only" type="file" data-share-target="input" data-action="change->share#select" />
           </div>
           <div class="selected-file" data-share-target="selected" hidden><span class="selected-icon">${icon("file", 19)}</span><span class="file-detail"><strong data-share-target="fileName"></strong><small data-share-target="fileSize"></small></span><button type="button" aria-label="Remove selected file" data-share-target="removeButton" data-action="share#remove">${icon("x", 18)}</button><div class="progress" data-share-target="progress" role="progressbar" aria-label="Upload progress" aria-valuemin="0" aria-valuemax="100" hidden><div class="progress-fill" data-share-target="progressFill"></div></div></div>
-          <div class="delivery-details"><label for="expiry"><span class="detail-icon">${icon("clock", 17)}</span><span>Link expires</span></label><select id="expiry" name="expiry" data-share-target="expiry"><option value="3600">In 1 hour</option><option value="86400" selected>In 1 day</option><option value="604800">In 7 days</option><option value="0">Never</option></select></div>
+          <div class="delivery-details"><label for="expiry"><span class="detail-icon">${icon("clock", 17)}</span><span>Link expires</span></label><select id="expiry" name="expiry" data-share-target="expiry"><option value="3600">In 1 hour</option><option value="86400" selected>In 1 day</option><option value="604800">In 7 days</option><option value="0">When unused for 7 days</option></select></div>
           <button class="primary-button" type="button" data-share-target="submit" data-action="share#send" disabled><span data-share-target="submitText">Create a private link</span>${icon("arrow", 19)}</button>
           <p class="card-footnote">${icon("lock", 13)} Your file is encrypted before it leaves this device.</p>
         </div>
@@ -243,7 +243,7 @@ class ShareController extends Controller<HTMLElement> {
       });
       this.resultNoteTarget.textContent = `Anyone with this link can decrypt your file. ${
         Number(expiry.value) === 0
-          ? "It never expires."
+          ? "It expires once it goes 7 days without a download."
           : `It expires ${expiry.text.toLowerCase()}.`
       }`;
       this.sendViewTarget.hidden = true;
